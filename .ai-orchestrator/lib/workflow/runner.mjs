@@ -1,0 +1,373 @@
+// The loop of `ao-step.mjs <command> <arg> --go` (dev-workflow spec 2.1, plan decision 3 and 7): decide, make the first
+// run, write state.json, gather the facts again, decide again, until the decision is STOP. Every effect is a parameter,
+// so tests run it without claude, git or the network:
+//   gather()                      the facts of the command (lib/workflow/facts.mjs)
+//   agent(run, { log })           starts ao-agent.mjs for one run and resolves { lines, stopped } when it ends; log is the
+//                                 name of its stream-json log in .ai/runs/<KEY>/; stopped: it stayed alive after its
+//                                 result and was stopped (lib/workflow/agent-process.mjs)
+//   git(checkout, run)            puts the checkout of the run on a branch: the project folder, or the lane of its item
+//                                 when project.yaml turns runs.worktrees on (parallel-runs spec 4); resolves { ok, reason }
+//   dispatch(action)              asks GitHub to run jira-sync for an item (the second /ao-plan)
+//   pack(run, facts)              writes the context pack of a full review run; resolves its path, or null (optional)
+//   worktree                      { add(spec), remove(spec) } for a run that has a worktree (a review: the code of its PR at
+//                                 its head; qa: the release that runs, with its packages); add resolves { ok, path,
+//                                 reason }, remove { ok, reason } (optional)
+//   after(run, { tree, facts })   what ao-step does once a run ends and before its worktree goes (qa: the evidence to
+//                                 Jira; seo: the commit of its change); run carries its startedAt; resolves notes for
+//                                 state.json and last.md, or { notes, stop } where stop is the reason the command stops
+//                                 there (optional)
+//   act(step)                     a script step of a release command, such as cutting the release branch; resolves notes
+//                                 for last.md. It is the one step of its command (optional)
+//   wip                           { save(run), restore(wip, run) } (lib/workflow/wip.mjs): save puts aside the work a run left
+//                                 uncommitted when it stopped before its end, resolving { stash, branch }, null, or
+//                                 { error }; restore applies it again before the run goes on in its session, resolving
+//                                 { ok, notes } or { ok: false, reason } (optional; live-run-fixes spec 2.1)
+//   store                         { readState(key), writeState(key, state), writeLast(key, text) }; a run is written when it
+//                                 starts and again when it ends
+//   sleep(ms), now(), log(line)
+// Within one command, agents run one after another, never two at once; runs.lanes_max lets several commands run side
+// by side, each on its own item (parallel-runs spec 5).
+import { packNote, qaWorktreeNote, wipNote, worktreeNote } from './prompts.mjs';
+import { readRun } from './runs.mjs';
+import { decideStep } from './steps.mjs';
+
+// ciStartMs: how long a PR head may wait for its first check run before the runner stops (SMP-2: GitHub started none).
+export const LIMITS = { maxRuns: 8, ciWaitMs: 30 * 60 * 1000, ciStartMs: 5 * 60 * 1000, syncWaitMs: 15 * 60 * 1000, pollMs: 30 * 1000 };
+// The most of an agent's answer state.json keeps; the whole answer stays in the run's log and in last.md.
+const TEXT_MAX = 2000;
+// Only a full review gets a pack: the pack holds the diff of the whole PR, and a review of the new part (review-delta)
+// reads the diff since its last report (Pilot 1, review of ao-sample PR #6).
+const PACKED = ['review'];
+
+// The command that starts one run: ao-agent.mjs with the role, the prompt, stream-json output, and the effort both as a
+// flag and as CLAUDE_CODE_EFFORT_LEVEL, which beats the flag and may be set in your environment (plan decision 6). It
+// carries no token: ao-agent.mjs buys the session's own. A run's own variables, such as the URL qa tests, come last.
+// CLAUDE_CODE_PROMPT_CACHE_TTL=5m: a run sends its requests seconds apart, so the five-minute cache is enough, and its
+// writes cost less than those of the one-hour cache that claude -p asks for on a subscription (Pilot 1, review of PR #4).
+export function agentCommand(run, kitDir) {
+  const script = `${kitDir.replaceAll('\\', '/').replace(/\/+$/, '')}/scripts/ao-agent.mjs`;
+  return {
+    command: process.execPath,
+    args: [script, run.role, '-p', run.prompt, '--output-format', 'stream-json', '--verbose', '--effort', run.effort, ...(run.resume ? ['--resume', run.resume] : [])],
+    env: { CLAUDE_CODE_EFFORT_LEVEL: run.effort, CLAUDE_CODE_PROMPT_CACHE_TTL: '5m', ...run.env },
+  };
+}
+
+// A stop of the runner: what it waits for (WAITS of lib/workflow/steps.mjs, C2 spec section 4) and why.
+const halt = (waits, reason) => ({ waits, reason });
+
+export async function runGo({ command, arg, options, gather, decide = decideStep, agent, git, dispatch, pack, worktree, after, act, wip, pair, unpair, store, sleep, now = Date.now, log = () => {}, limits: given = {} }) {
+  const limits = { ...LIMITS, ...given };
+  let facts = await gather();
+  let decision = decide(command, facts, options);
+  // A release command has no work item: its report goes under the release, such as .ai/runs/v0.1.0/.
+  const key = facts.item?.key ?? facts.runKey;
+  const made = [];
+  let stop = null;
+  let previous = null;
+
+  // The number of the next run: one more than state.json and than any run this command reserved, so two runs at once
+  // never share one.
+  // The highest number on record, not that of the last record: two runs at once go on record in the order they start
+  // their agents, and on SHOP-89 of shop security came before reviewer, so the QA after them took number 2 again and
+  // wrote over the run of security (T14 of C2).
+  let reserved = 0;
+  const reserve = () => {
+    reserved = Math.max(0, ...(store.readState(key)?.runs ?? []).map(({ n }) => n ?? 0), reserved) + 1;
+    return reserved;
+  };
+  // Writes one record of state.json, its own by number: read, change, write, with nothing awaited between, so two runs
+  // at once never write over each other (C2 spec section 7). The runs stay in the order of their numbers, so the last
+  // record is the newest run wherever it is read (withLoggedSession, carryOn), and a state.json an earlier kit left out
+  // of order is put right at its next write.
+  const put = (record) => {
+    const state = store.readState(key) ?? { key, runs: [] };
+    const at = state.runs.findIndex(({ n }) => n === record.n);
+    const runs = at === -1 ? [...state.runs, record] : state.runs.map((r, i) => (i === at ? record : r));
+    store.writeState(key, { ...state, runs: runs.sort((a, b) => (a.n ?? 0) - (b.n ?? 0)) });
+  };
+
+  // One run of an agent, on a checkout already in place: { record, read, stop }, or { stop } when it could not start.
+  async function makeRun(next) {
+    const state = store.readState(key) ?? { key, runs: [] };
+    const n = reserve();
+    const logName = `${n}-${next.role}.jsonl`;
+    const resumed = next.resume ? state.runs.findLast((r) => r.session === next.resume) : undefined;
+    // The work the run left uncommitted comes back first, once the checkout is on its branch; or nothing runs.
+    let restored = false;
+    let wipNotes = [];
+    if (resumed?.wip && wip) {
+      const back = await wip.restore(resumed.wip, next);
+      if (!back.ok) return { stop: halt('fix', back.reason) };
+      restored = true;
+      wipNotes = back.notes ?? [];
+      // Its stash is dropped: off the record at once, so a run that cannot start after this does not name it again
+      // (review of ao-sample PR #30).
+      put({ ...resumed, wip: undefined });
+    }
+    log(`${n}. ${next.role} ${next.key} ${next.purpose}, effort ${next.effort}${next.resume ? ', resumes its session' : ''}`);
+    const startedAt = new Date(now()).toISOString();
+    // A review starts from the context pack of its PR (Pilot 1, review cost, option 2), written from the facts it was
+    // decided on; without one the agent fetches what it needs itself.
+    const file = pack && PACKED.includes(next.purpose) ? await pack(next, facts) : null;
+    // The worktree of the PR is added just before the run and removed when it ends, whatever way it ends.
+    const tree = next.worktree && worktree ? await worktree.add(next.worktree) : null;
+    if (tree && !tree.ok) return { stop: halt('fix', tree.reason) };
+    const treeNote = tree && (next.worktree.kind === 'qa' ? qaWorktreeNote : worktreeNote)(tree.path, next.worktree.sha);
+    const notes = [file && packNote(file), treeNote, restored && wipNote].filter(Boolean);
+    const run = {
+      n,
+      command,
+      role: next.role,
+      key: next.key,
+      purpose: next.purpose,
+      effort: next.effort,
+      log: logName,
+      startedAt,
+      ...(next.resume && { resumed: true }),
+      // The Story of a Sub-task: its run works in the lane of the Story (parallel-runs spec 4).
+      ...(next.story && { story: next.story }),
+      ...(next.checkout && { checkout: next.checkout }),
+      ...(next.head && { head: next.head }),
+      ...(next.note && { note: next.note }),
+      // The time of the request a run of /ao-request answers (human-loop spec 3.3).
+      ...(next.request && { request: next.request }),
+      // The QA report a rebuild after QA fail answers (human-loop spec 5.2).
+      ...(next.rebuild && { rebuild: next.rebuild }),
+      // The release a qa run tested: /ao-ship checks its regression still holds for the head (release-workflow T15).
+      ...(next.qa && { qa: { environment: next.qa.environment, sha: next.qa.sha } }),
+    };
+    // On record from its start: a shell killed during the run leaves it unfinished, and the next command goes on in the
+    // session of its log (release-workflow T22). What its session cost so far stays, for the run that resumes it.
+    put({ ...run, session: next.resume ?? null, outcome: 'unfinished', turns: 0, durationMs: 0, costUsd: null, ...(resumed?.cumulative && { cumulative: resumed.cumulative }) });
+    let lines;
+    let superseded;
+    let stopped;
+    let runNotes = [];
+    let afterStop;
+    // What ao-step read after the run that the record keeps, such as the hash of the report of a review after merge.
+    let afterRecord;
+    try {
+      ({ lines, stopped, superseded } = await agent(notes.length > 0 ? { ...next, prompt: [next.prompt, ...notes].join('\n\n') } : next, { log: logName }));
+      // With the start of the run: qa attaches only what it wrote since (live-run-fixes spec 2.5).
+      // A superseded qa run attaches nothing: what it saw was a version that no longer runs.
+      if (after && !superseded) {
+        const done = await after({ ...next, startedAt }, { tree, facts });
+        ({ notes: runNotes = [], stop: afterStop, record: afterRecord } = Array.isArray(done) ? { notes: done } : (done ?? {}));
+      }
+    } finally {
+      if (tree) {
+        const removed = await worktree.remove(next.worktree);
+        if (!removed.ok) log(`the worktree of ${next.worktree.name} stays: ${removed.reason}`);
+      }
+    }
+    if (stopped) log(`${next.role} stayed alive after its result and was stopped with what it left running`);
+    if (superseded) log(superseded);
+    const read = readRun(lines, resumed);
+    // A qa run stopped because another deploy came during it: it reported nothing, and is made again on the new version.
+    if (superseded) read.outcome = 'superseded';
+    const record = {
+      ...run,
+      session: read.session,
+      outcome: read.outcome,
+      turns: read.turns,
+      durationMs: read.durationMs,
+      costUsd: read.costUsd,
+      tokens: read.tokens,
+      cumulative: read.cumulative,
+      denials: read.denials.length,
+      endedAt: new Date(now()).toISOString(),
+      ...afterRecord,
+      ...(stopped && { stoppedAfterResult: true }),
+      ...(wipNotes.length + runNotes.length + (superseded ? 1 : 0) > 0 && { notes: [...wipNotes, ...runNotes, ...(superseded ? [superseded] : [])] }),
+      text: read.text.length > TEXT_MAX ? `${read.text.slice(0, TEXT_MAX)} … [cut at ${TEXT_MAX} characters; the whole answer is in ${logName}]` : read.text,
+    };
+    // state.json is written before anything else, so a stopped shell can go on from here.
+    put(record);
+    // A run that stopped before its end may leave work not committed, which keeps the next command from switching the
+    // checkout: it goes aside, and its stash on the record (live-run-fixes spec 2.1).
+    let aside = '';
+    if (wip && ['usage-limit', 'unfinished'].includes(read.outcome)) {
+      const saved = await wip.save(record);
+      if (saved?.error) aside = `. Its work not committed could not be put aside (${saved.error}): put it aside yourself with git stash push --include-untracked before the next command`;
+      else if (saved) {
+        record.wip = saved;
+        put(record);
+        aside = `. Its work not committed is in stash ${saved.stash.slice(0, 8)}, and comes back when the run goes on`;
+      }
+    }
+    if (read.outcome === 'usage-limit') return { record, read, stop: halt('usage', `${next.role} hit the usage limit: ${read.text}. Run the same command again after it resets; the run goes on in its session${aside}`) };
+    if (read.outcome === 'unfinished') return { record, read, stop: halt('next', `${next.role} stopped without a result: run the same command again; the run goes on in its session${aside}`) };
+    // What ao-step does after the run found something you decide, such as a change of seo outside docs/specs/.
+    if (afterStop) return { record, read, stop: halt('you', afterStop) };
+    return { record, read, stop: null };
+  }
+
+  while (decision.go && !stop) {
+    const [next] = decision.runs;
+    if (made.length >= limits.maxRuns) {
+      stop = halt('next', `${made.length} runs in one command, the most the runner makes; run the command again to go on`);
+      break;
+    }
+    if (next.action === 'jira-sync') {
+      log(`jira-sync for ${next.key}`);
+      await dispatch(next);
+      made.push({ action: 'jira-sync', key: next.key });
+      ({ facts, decision } = await waitFor(() => gather(), (f) => decide(command, f, { ...options, answers: undefined, note: undefined, lightReport: undefined }), (d) => !(d.go && d.runs[0]?.action === 'jira-sync'), limits.syncWaitMs, { sleep, now, limits }));
+      if (decision.go && decision.runs[0]?.action === 'jira-sync') stop = halt('fix', `jira-sync ran, but ${next.key} is not done after ${Math.round(limits.syncWaitMs / 60000)} minutes: see the jira-sync and merge-gate runs on GitHub`);
+      // With continue, jira-sync is a first step, as for an item it refines before its build: the command goes on.
+      if (next.continue) continue;
+      break;
+    }
+    if (next.action) {
+      log(`${next.action} ${next.key}`);
+      made.push({ action: next.action, key: next.key, notes: await act(next) });
+      // An action with `continue` is a first step, such as marking a draft PR ready before its review (human-loop spec
+      // 4.6): the command goes on with what is decided after it, once GitHub shows its effect. Any other action is the
+      // one step of its command.
+      if (next.continue) {
+        const again = (d) => d.go && d.runs[0]?.action === next.action;
+        ({ facts, decision } = await waitFor(() => gather(), (f) => decide(command, f, { ...options, answers: undefined, note: undefined, lightReport: undefined }), (d) => !again(d), limits.syncWaitMs, { sleep, now, limits }));
+        if (again(decision)) stop = halt('fix', `${next.action} ran on ${next.key}, but the facts still ask for it after ${Math.round(limits.syncWaitMs / 60000)} minutes: run the command again`);
+        continue;
+      }
+      facts = await gather();
+      decision = decide(command, facts, { ...options, answers: undefined, note: undefined, lightReport: undefined });
+      break;
+    }
+    // The same run again right after it ended well means the agent did not do what the facts look for.
+    if (previous && previous.outcome === 'done' && same(previous, next)) {
+      stop = halt('you', `${next.role} ran ${next.purpose} on ${next.key} and it still has to run: read its answer in .ai/runs/${key}/last.md`);
+      break;
+    }
+    // Runs marked together, reviewer and security, run at once when a second agent may start (C2 spec section 7):
+    // pair(run) takes its place and resolves its lock, or null, and they run one after another as before. They share
+    // one checkout: two git commands at once on one folder clash.
+    const [partner] = next.together ? decision.runs.filter((r) => r.together && r !== next) : [];
+    const agentLock = partner && pair && JSON.stringify(partner.checkout) === JSON.stringify(next.checkout) ? await pair(partner) : null;
+    const batch = agentLock ? [next, { ...partner, agentLock }] : [next];
+    if (next.checkout) {
+      const ready = await git(next.checkout, next);
+      if (!ready.ok) {
+        if (agentLock) await unpair?.(agentLock);
+        stop = halt('fix', ready.reason);
+        break;
+      }
+    }
+    const settled = await Promise.allSettled(
+      batch.map(async (run) => {
+        try {
+          return await makeRun(run);
+        } finally {
+          if (run.agentLock) await unpair?.(run.agentLock);
+        }
+      }),
+    );
+    const failure = settled.find(({ status }) => status === 'rejected');
+    if (failure) throw failure.reason;
+    for (const { value } of settled) {
+      if (value.record) {
+        // last.md gets the whole answer: it is what Claude reads to tell you what the agent said (Pilot 1, SMP-2).
+        made.push({ ...value.record, text: value.read.text });
+        previous = value.record;
+      }
+      stop ??= value.stop;
+    }
+    if (stop) break;
+    // After a run that may have pushed, wait for CI before deciding again, but not for a CI that never starts.
+    const since = now();
+    const startMs = Math.min(limits.ciStartMs, limits.ciWaitMs);
+    ({ facts, decision } = await waitFor(() => gather(), (f) => decide(command, f, { ...options, answers: undefined }), (_, f) => !ciPending(f) || (ciIdle(f) && (ciIdle(f).conflicts || now() - since >= startMs)), limits.ciWaitMs, { sleep, now, limits }));
+    const idle = ciIdle(facts);
+    // GitHub runs no workflow of pull_request on a PR it cannot merge (PR #57 of shop, SHOP-31).
+    if (idle?.conflicts) stop = halt('fix', `PR #${idle.number} conflicts with ${idle.base}, and GitHub runs no CI on a PR it cannot merge: merge origin/${idle.base} into its branch, resolve the conflict, push, then run the command again`);
+    else if (idle) stop = halt('fix', `no CI run started on PR #${idle.number} after ${Math.round(startMs / 60000)} minutes: GitHub Actions did not start the workflows. Open the Actions tab of the repo; on a new repo, push a commit that touches .github/workflows/, then run the command again`);
+    else if (ciPending(facts)) stop = halt('ci', `CI is still running after ${Math.round(limits.ciWaitMs / 60000)} minutes: run the command again once it is done`);
+  }
+  // The runner's own stops say what they wait for too (C2 spec section 4); next runs the same command again.
+  const rerun = stop?.waits === 'next' ? { then: { command, arg } } : {};
+  const final = stop ? { go: false, reason: stop.reason, next: `/ao-${command} ${arg ?? ''}`.trim(), waits: stop.waits, ...rerun, lines: decision.lines ?? [] } : decision;
+  if (key) store.writeLast(key, lastReport({ command, key, made, decision: final, state: store.readState(key) }));
+  // facts: what the last decision was made on, so ao-step can put the checkout on the base of the PR.
+  return { decision: final, made, facts };
+}
+
+// Two requests to one role are two runs (human-loop spec 3.3): `request` is the time of the comment.
+const same = (a, b) => a.role === b.role && a.purpose === b.purpose && a.key === b.key && a.request === b.request && !b.resume;
+
+const ciPending = (facts) => Boolean((facts.pr?.state === 'open' && facts.pr.ci.pending) || (facts.docs?.pr?.state === 'open' && facts.docs.pr.ci.pending));
+// The open PR whose head has no check run or status yet; null when CI started everywhere.
+const ciIdle = (facts) => [facts.pr, facts.docs?.pr].find((pr) => pr?.state === 'open' && pr.ci.pending && pr.ci.started === false) ?? null;
+
+// Gathers and decides until `done(decision, facts)` or the time is up.
+async function waitFor(gatherFacts, decideOn, done, waitMs, { sleep, now, limits }) {
+  const until = now() + waitMs;
+  for (;;) {
+    const facts = await gatherFacts();
+    const decision = decideOn(facts);
+    if (done(decision, facts) || now() >= until) return { facts, decision };
+    await sleep(limits.pollMs);
+  }
+}
+
+// null: a run stopped before its result, whose cost is not known (lib/workflow/runs.mjs).
+const usd = (value) => (value === null ? 'unknown' : `${(value ?? 0).toFixed(2)} USD`);
+const minutes = (ms) => `${Math.round((ms ?? 0) / 6000) / 10} min`;
+
+// The printout of a decision (spec section 6): the facts, then GO with the runs, STOP with the reason, or the status.
+export function formatDecision(decision) {
+  const out = [...(decision.lines ?? [])];
+  if (decision.status) {
+    if (decision.next) out.push(`Next: ${decision.next}`);
+    return out.join('\n');
+  }
+  if (decision.go) {
+    out.push('GO');
+    decision.runs.forEach((run, i) => {
+      if (run.action === 'jira-sync') {
+        out.push(`${i + 1}. jira-sync for ${run.key}, with your gh login${run.then?.mergeGate ? `; then merge-gate merges the docs PR #${run.then.mergeGate}` : ''}`);
+        return;
+      }
+      if (run.action) {
+        out.push(`${i + 1}. ${run.action} for ${run.key}, a script: no agent runs`);
+        return;
+      }
+      const extras = [run.resume && 'resumes its session', run.when && `when ${run.when}`, run.scope, run.effortWhy && `effort ${run.effort}: ${run.effortWhy}`].filter(Boolean);
+      out.push(`${i + 1}. ${run.role} ${run.key}, ${run.purpose}, effort ${run.effort}${extras.length ? ` (${extras.join('; ')})` : ''}`);
+    });
+    return out.join('\n');
+  }
+  out.push(`STOP: ${decision.reason}`);
+  if (decision.questions?.length) out.push('Questions:', ...decision.questions.map((q) => `- ${q}`));
+  if (decision.next) out.push(`Next: ${decision.next}`);
+  return out.join('\n');
+}
+
+// .ai/runs/<KEY>/last.md: what this command did, run by run, and what comes next.
+export function lastReport({ command, key, made, decision, state }) {
+  const all = state?.runs ?? [];
+  const total = all.reduce((sum, r) => sum + (r.costUsd ?? 0), 0);
+  const unknown = all.filter((r) => r.costUsd === null).length;
+  const rows = made.map((r) => (r.action ? `| - | ${r.action} | ${r.key} | | | | | |` : `| ${r.n} | ${r.role} | ${r.key} | ${r.purpose} | ${r.effort} | ${r.outcome} | ${r.turns} turns, ${minutes(r.durationMs)} | ${usd(r.costUsd)} |`));
+  const text = [
+    `# ${command} ${key}`,
+    '',
+    made.length > 0 ? '| # | Role | Item | Step | Effort | Outcome | Turns, time | Cost |\n|---|---|---|---|---|---|---|---|' : 'No run was made.',
+    ...rows,
+    '',
+    `Cost of every run on ${key} so far: ${usd(total)}${unknown > 0 ? `, and ${unknown} run${unknown === 1 ? '' : 's'} stopped before ${unknown === 1 ? 'its' : 'their'} result, of unknown cost` : ''}.`,
+    '',
+    ...made.filter((r) => r.text || r.notes?.length).flatMap((r) => [
+      ...(r.text ? [`## ${r.n}. ${r.role}: its answer`, '', r.text, ''] : []),
+      ...(r.notes?.length ? [r.action ? `## ${r.action}` : `## ${r.n}. ${r.role}: notes of the orchestrator`, '', ...r.notes.map((note) => `- ${note}`), ''] : []),
+    ]),
+    // A state, such as the preview that now runs, is not a stop (Pilot 3, T4): formatDecision gives its lines and Next.
+    decision.go || decision.status ? '## Next' : '## Stopped',
+    '',
+    decision.go || decision.status ? formatDecision(decision) : `${decision.reason}.`,
+    ...(decision.questions?.length ? ['', '## Questions', '', ...decision.questions.map((q) => `- ${q}`)] : []),
+    ...(decision.next && !decision.status ? ['', `Next: ${decision.next}`] : []),
+    '',
+  ];
+  return text.join('\n');
+}

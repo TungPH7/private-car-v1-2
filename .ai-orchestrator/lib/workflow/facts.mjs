@@ -1,0 +1,782 @@
+// The facts ao-step.mjs decides on (dev-workflow spec 2.2): a work item and its Epic from Jira, the docs PR of the Epic
+// and the newest PR of the item from GitHub, and the ledger and run state in .ai/. Every reader takes its clients:
+// `jira` (lib/tracker/jira-client.mjs, the agent token), `github` (lib/tracker/github-client.mjs, the read-only token of
+// ao-review) and `local` ({ ledger(key), runState(key), runStates() }, the files in .ai/). Nothing here writes.
+// The contract guards come from lib/tracker/facts.mjs, not written again.
+import { createHash } from 'node:crypto';
+import { docsPullRequest, gatePassage } from '../quality/docs-pr.mjs';
+import { docsRule } from '../quality/gates.mjs';
+import { approved, botLogin, protectedPaths, releasePullsOf, releaseReviewMissing } from '../quality/merge-gate.mjs';
+import { acceptedRisks, findingCounts, findingId, openFindings, readReviewReport, stillBlocking } from '../quality/pull-request.mjs';
+import { criticalNames, pathTier, requiredReviewRoles } from '../quality/review-tiers.mjs';
+import { madeFacts, newestMark, reviewChoice, reviewLabels, skipOnHead, skippedReview } from '../quality/review-choice.mjs';
+import { descriptionLinks } from '../quality/design-inbox.mjs';
+import { touchedPaths } from '../quality/diff-paths.mjs';
+import { waiverOnHead } from '../quality/waivers.mjs';
+import { parseBranch } from '../tracker/conventions.mjs';
+import { adfText, agentValues, changesRequestedOn, githubGuards, sameRepo, jiraGuards, qaEnvironment, readChecks, notQaSigners, readLatestQaReport, wipHolders } from '../tracker/facts.mjs';
+import { latestFlagComment } from '../tracker/flags.mjs';
+import { countRework } from '../tracker/rework.mjs';
+import { recordedLine } from './findings.mjs';
+import { agentsAccount, labelLevel, trustedLevel } from './levels.mjs';
+import { openRequests } from './requests.mjs';
+import { ownChanges } from './security-scope.mjs';
+import { cutPoint } from '../release/cut.mjs';
+import { parseHistory } from '../release/release-cut.mjs';
+import { regressionResult } from '../release/release-pr.mjs';
+import { latestTag, nextPatch, nextRelease } from '../release/versions.mjs';
+
+const GATES = ['spec-approval', 'plan-approval'];
+
+// The level of an item and the lower label left out (lib/workflow/levels.mjs, trustedLevel), as facts of the item.
+const levelFacts = ({ level, ignored }) => ({ level, levelIgnored: ignored });
+
+// role → the value of the Agent field, such as { ba: 'Business Analyst' }: agentValues of lib/tracker/facts.mjs, so the
+// signature of a comment, the QA report readers and the requests read one rule (review of shop PR #90, reviewer, Low).
+export const agentNames = agentValues;
+
+// The dev role and the effort a work item's labels name (tracker/jira.yaml, work_labels): ao-fe-dev → fe-dev,
+// ao-effort-xhigh → xhigh. Only roles of the roster and efforts claude takes count; null when there is none.
+export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+export function workLabels(labels, mapping, roster) {
+  const { role_prefix: rolePrefix, effort_prefix: effortPrefix, level_prefix: levelPrefix, seo: seoLabel } = mapping.work_labels;
+  const efforts = labels.filter((label) => label.startsWith(effortPrefix)).map((label) => label.slice(effortPrefix.length)).filter((e) => EFFORTS.includes(e));
+  // ao-seo marks an item with an SEO part (C1 spec 6.6), and is no role label though seo is a role of the roster.
+  const roles = labels.filter((label) => label.startsWith(rolePrefix) && !label.startsWith(effortPrefix) && label !== seoLabel).map((label) => label.slice(rolePrefix.length)).filter((r) => roster.roles[r]);
+  // level: the process level the label names, or null for standard (C1 spec section 2).
+  return {
+    role: roles[0] ?? null,
+    roles,
+    effort: efforts.sort((a, b) => EFFORTS.indexOf(b) - EFFORTS.indexOf(a))[0] ?? null,
+    level: levelPrefix ? labelLevel(labels, levelPrefix) : null,
+    seo: Boolean(seoLabel) && labels.includes(seoLabel),
+  };
+}
+
+// The contract work type and state of a Jira type and status, or nulls.
+function locate(type, status, contract, mapping) {
+  const workType = contract.work_types.find(({ jira_issue_type: name }) => name === type)?.id ?? null;
+  const workflowId = workType && Object.keys(contract.workflows).find((id) => contract.workflows[id].applies_to.includes(workType));
+  const states = workflowId ? mapping.workflows[workflowId].states : {};
+  return { workType, state: Object.keys(states).find((id) => states[id].status === status) ?? null };
+}
+
+// One work item with everything ao-step decides on. ctx: { contract, mapping, roster }.
+export async function readWorkItem(jira, key, ctx) {
+  const { contract, mapping, roster } = ctx;
+  const path = `/rest/api/3/issue/${encodeURIComponent(key)}`;
+  const agentField = await fieldId(jira, mapping.fields.agent.jira_field);
+  const { key: found, fields } = await jira.get(path, { fields: ['summary', 'issuetype', 'status', 'labels', 'parent', 'subtasks', 'issuelinks', 'creator', 'created', agentField].join(',') });
+  const histories = await jira.getAll(`${path}/changelog`);
+  const comments = await jira.getAll(`${path}/comment`, {}, 'comments');
+  const { workType, state } = locate(fields.issuetype.name, fields.status.name, contract, mapping);
+  const names = agentNames(contract, mapping);
+  const labels = fields.labels ?? [];
+  const flagged = labels.includes(mapping.needs_you_label);
+  const subtasks = [];
+  for (const { key: sub } of fields.subtasks ?? []) {
+    const { fields: f } = await jira.get(`/rest/api/3/issue/${encodeURIComponent(sub)}`, { fields: 'summary,issuetype,status,labels' });
+    subtasks.push({ key: sub, summary: f.summary, ...locate(f.issuetype.name, f.status.name, contract, mapping), status: f.status.name, labels: f.labels ?? [], flagged: (f.labels ?? []).includes(mapping.needs_you_label), ...workLabels(f.labels ?? [], mapping, roster) });
+  }
+  return {
+    key: found,
+    type: fields.issuetype.name,
+    workType,
+    state,
+    status: fields.status.name,
+    summary: fields.summary,
+    labels,
+    ...workLabels(labels, mapping, roster),
+    // A level the agents' account lowered after it created the item does not count: only you lower one (reviews of shop
+    // PR #79). levelIgnored: the lower label left out, which /ao-status and the review name.
+    ...levelFacts(trustedLevel(labels, histories, { agentAccount: agentsAccount(mapping), prefix: mapping.work_labels.level_prefix })),
+    // Whether the item skips review (SPEC-review-per-item.md section 2), as merge-gate works it out: its labels, with a
+    // change of the agents' account towards skipping left out, and the default of project.yaml (ctx.reviewDefault). A skip
+    // set when the agents' account made the item counts only from a plan you approved (review of shop PR #93).
+    review: reviewChoice({ labels, histories, agentAccount: agentsAccount(mapping), names: reviewLabels(mapping), projectDefault: ctx.reviewDefault, made: await madeFacts(jira, { fields, labels, names: reviewLabels(mapping), agentAccount: agentsAccount(mapping) }, mapping) }),
+    // An ops Task, and the basic auth you gave devops for it (kit followups, batch 4 item 14).
+    ops: labels.includes(mapping.work_labels.ops),
+    envAuth: labels.includes(mapping.work_labels.env_auth),
+    agent: Object.keys(names).find((role) => names[role] === fields[agentField]?.value) ?? null,
+    rework: workType ? countRework(histories, { contract, mapping, workType }) : 0,
+    flagged,
+    flag: flagged ? (latestFlagComment(comments)?.kind ?? 'other') : null,
+    parent: fields.parent ? { key: fields.parent.key, type: fields.parent.fields.issuetype.name, status: fields.parent.fields.status.name } : null,
+    subtasks,
+    blockedBy: blockedByOf(fields),
+    gates: workType === 'epic' ? gateTimes(histories, contract, mapping) : {},
+    children: workType === 'epic' ? await readChildren(jira, found, ctx) : [],
+    requests: openRequests(comments, names, { agentAccount: agentsAccount(mapping) }),
+    // What /ao-build shows you before an item with ao-seo outside an Epic starts (second review of shop PR #79).
+    seoComment: newestSigned(comments, names.seo)?.text ?? null,
+    // Its mark, which your seo-ok holds (review of shop PR #80): the id, and a hash of its whole body, which an edit changes.
+    seoMark: seoMarkOf(newestSigned(comments, names.seo)),
+  };
+}
+
+// The newest comment that starts with an Agent value, as agents sign theirs (agents/rules.md): { id, text }, or null.
+function newestSigned(comments, agentName) {
+  if (!agentName) return null;
+  const signed = comments
+    .map(({ id, body, created }) => ({ id: id ?? null, body, text: (typeof body === 'string' ? body : adfText(body)).trim(), at: Date.parse(String(created).replace(/([+-]\d\d)(\d\d)$/, '$1:$2')) }))
+    .filter(({ text }) => text.startsWith(`${agentName}:`))
+    .sort((a, b) => b.at - a.at);
+  return signed[0] ?? null;
+}
+
+// The hash takes the whole body, so the target of a link or a card changes it too (review of shop PR #81).
+const seoMarkOf = (comment) => (comment ? { id: comment.id, hash: createHash('sha256').update(typeof comment.body === 'string' ? comment.body : JSON.stringify(comment.body ?? null)).digest('hex').slice(0, 16) } : null);
+
+// The mark of the comment of seo your seo-ok holds, which ao-step keeps in .ai/runs/<KEY>/seo-ok.json, or null.
+function seoApprovedOf(local, key) {
+  const text = local.runFile?.(key, 'seo-ok.json');
+  if (!text) return null;
+  try {
+    const { id = null, hash = null } = JSON.parse(text);
+    return { id, hash };
+  } catch {
+    return null;
+  }
+}
+
+// The keys of the items that block this one: the inward side of its "is blocked by" links.
+const blockedByOf = (fields) => (fields.issuelinks ?? []).filter(({ type, inwardIssue }) => type?.inward === 'is blocked by' && inwardIssue).map(({ inwardIssue }) => inwardIssue.key);
+
+// The Stories, Tasks and Bugs of an Epic, which ba creates in stage plan.
+// Each comes with its Sub-tasks: a Story split into Sub-tasks carries its role and effort labels on them.
+async function readChildren(jira, epic, { contract, mapping, roster, space }) {
+  const item = ({ key, fields }) => ({ key, summary: fields.summary, ...locate(fields.issuetype.name, fields.status.name, contract, mapping), status: fields.status.name, labels: fields.labels ?? [], blockedBy: blockedByOf(fields), fixVersions: (fields.fixVersions ?? []).map(({ name, released }) => ({ name, released: Boolean(released) })), ...workLabels(fields.labels ?? [], mapping, roster) });
+  const found = await jira.searchAll(`project = "${space}" AND parent = "${epic}"`, ['summary', 'issuetype', 'status', 'labels', 'issuelinks', 'fixVersions']);
+  const keys = found.map(({ key }) => `"${key}"`);
+  const subtasks = keys.length > 0 ? await jira.searchAll(`project = "${space}" AND parent in (${keys.join(', ')})`, ['summary', 'issuetype', 'status', 'labels', 'parent']) : [];
+  return found.map((child) => ({ ...item(child), subtasks: subtasks.filter(({ fields }) => fields.parent?.key === child.key).map(item) }));
+}
+
+// When the Epic last passed each gate, from its changelog: { 'spec-approval': ms | null, 'plan-approval': ms | null }.
+function gateTimes(histories, contract, mapping) {
+  const times = {};
+  for (const gate of GATES) {
+    const passage = gatePassage(contract, mapping, gate);
+    const moves = histories.filter(({ items }) => items.some((c) => c.field === 'status' && passage.from.includes(c.fromString) && c.toString === passage.to));
+    times[gate] = moves.length > 0 ? Math.max(...moves.map(({ created }) => Date.parse(String(created).replace(/([+-]\d\d)(\d\d)$/, '$1:$2')))) : null;
+  }
+  return times;
+}
+
+async function fieldId(jira, name) {
+  const field = (await jira.get('/rest/api/3/field')).find((f) => f.name === name);
+  if (!field) throw new Error(`Jira has no field ${name}`);
+  return field.id;
+}
+
+// GET that answers null on 404.
+async function maybe(read) {
+  try {
+    return await read();
+  } catch (error) {
+    if (error.status === 404 || /returned 404/.test(error.message)) return null;
+    throw error;
+  }
+}
+
+// .ai-orchestrator/project.yaml at a commit, read through GitHub, or null: the hosts of its public apps tell qa where
+// each one answers (project-scaffold part 2, spec 2.4).
+async function projectAt(github, sha) {
+  const file = await maybe(() => github.get('/contents/.ai-orchestrator/project.yaml', { ref: sha }));
+  return file?.content ? Buffer.from(file.content, 'base64').toString('utf8') : null;
+}
+
+// The PRs of a work item's branches, newest first, from this repository only: a PR from a fork is never an item's,
+// whatever its branch is called, since the repository is public and /ao-run would review and fix an outsider's code
+// (review of shop PR #80).
+export async function pullsOf(github, key) {
+  const all = await github.getAll('/pulls', { state: 'all', sort: 'created', direction: 'desc' });
+  return all.filter((pr) => sameRepo(pr) && parseBranch(pr.head.ref)?.key === key);
+}
+
+// The CI of a commit. The read-only token of ao-review has no Commit statuses permission (spec 2.3), so GitHub refuses
+// the older commit statuses (T12): CI is then read from the check runs alone, where GitHub Actions reports. merge-gate
+// and audit, with the workflow token, still read both.
+function checksOf(github, sha) {
+  const get = async (path, query) => {
+    try {
+      return await github.get(path, query);
+    } catch (error) {
+      if (path.endsWith('/status') && (error.status === 403 || /returned 403/.test(error.message))) return { state: null, total_count: 0, statuses: [] };
+      throw error;
+    }
+  };
+  return readChecks({ ...github, get }, sha);
+}
+
+// One PR with its CI, the review reports of the ao-review App and your decision. ctx: { gates, apps, approvers }; `now`
+// dates the Highs you accept (Pilot 3, spec 2.9 part 5).
+export async function readPullRequest(github, number, { gates, apps, approvers = [], space, now = () => new Date() }) {
+  const pr = await github.get(`/pulls/${number}`);
+  const head = pr.head.sha;
+  const [reviews, files, checks] = [await github.getAll(`/pulls/${number}/reviews`), await github.getAll(`/pulls/${number}/files`), await checksOf(github, head)];
+  const on = now().toISOString().slice(0, 10);
+  const { reports, securityFull, reviewerFull, reported, blockingEver, minor } = reviewReports(reviews, { roles: gates.github_apps.review.roles, bot: botLogin(apps.review), head, approvers, on });
+  // From the newest full report of each role to the head, for a review of the new part only (spec 2.6; the reviewer
+  // too since C1 spec 3.2). One compare per commit, when both roles count from the same one.
+  const compares = new Map();
+  const compareFrom = async (role, full) => {
+    const since = reports[role] && !reports[role].onHead ? full?.sha : null;
+    if (!since) return null;
+    if (!compares.has(since)) compares.set(since, await maybe(() => github.get(`/compare/${since}...${head}`)));
+    const compare = compares.get(since);
+    return compare && { base: since, status: compare.status, files: ownChanges((compare.files ?? []).map(({ filename, previous_filename: previous, additions, deletions }) => ({ filename, previous_filename: previous, additions, deletions })), files.map(({ filename }) => filename)) };
+  };
+  const securityCompare = await compareFrom('security', securityFull);
+  const reviewerCompare = await compareFrom('reviewer', reviewerFull);
+  // The tier of the PR, and the reports the merge needs, as merge-gate works them out (C1 spec 3.1, 3.2).
+  const cut = Number.isInteger(pr.changed_files) && files.length < pr.changed_files;
+  const { tier } = pathTier(files, gates, { truncated: cut });
+  const requiredRoles = requiredReviewRoles({ roles: gates.github_apps.review.roles, tier, reported });
+  return {
+    number: pr.number,
+    title: pr.title,
+    body: pr.body ?? '',
+    state: pr.state,
+    // Only the files the PR changes itself: a merge of develop into its branch brings no new part (PR #41 of shop).
+    securityCompare,
+    reviewerCompare,
+    merged: Boolean(pr.merged_at),
+    mergeCommit: pr.merged_at ? pr.merge_commit_sha : null,
+    mergedAt: pr.merged_at ?? null,
+    draft: Boolean(pr.draft),
+    // dirty: the PR conflicts with its base, and GitHub runs no workflow of pull_request on it (PR #57 of shop).
+    conflicts: pr.mergeable_state === 'dirty',
+    // A PR from a fork may share the name of a branch here; /ao-preview runs only branches of this repository. Only a
+    // head and base both named this repository count as one: GitHub gives head.repo null once the fork is deleted
+    // (live-run-fixes spec 2.8).
+    fromFork: !sameRepo(pr),
+    author: pr.user?.login ?? null,
+    headRef: pr.head.ref,
+    headSha: head,
+    base: pr.base.ref,
+    // A renamed file by both names, as protectedPaths counts it: moved out of a risky path, it is still risky.
+    files: files.flatMap(({ filename, previous_filename: previous }) => (previous ? [previous, filename] : [filename])),
+    // GitHub lists at most 3000 files of a PR: /ao-preview checks only a PR it read whole (live-run-fixes spec 2.7).
+    changedFiles: pr.changed_files ?? null,
+    filesRead: files.length,
+    protectedPaths: protectedPaths(files, gates),
+    docsEpic: docsPullRequest({ pr, files, gates, apps, space }),
+    ci: { green: checks.green, failed: checks.failed, pending: !checks.green && !checks.failed, started: checks.started },
+    reports,
+    securityFull,
+    reviewerFull,
+    tier,
+    requiredRoles,
+    blockingEver,
+    minorFindings: minor,
+    // The review waived by rule whose trace is on the head, or null (C1 spec 3.4).
+    waiverOnHead: waiverOnHead(reviews, { bot: botLogin(apps.review), head }),
+    // The item whose skipped review is traced on the head, or null, and the critical files gate ③ names then
+    // (SPEC-review-per-item.md 3.1, 3.2).
+    skipOnHead: skipOnHead(reviews, { bot: botLogin(apps.review), head }),
+    critical: criticalNames(files, gates),
+    changesRequested: changesRequestedOn(reviews, head),
+    approved: approved({ pr, reviews, approvers }),
+  };
+}
+
+// The review reports the ao-review App (`bot`) posted among `reviews` (oldest first): the newest of each role, and the
+// newest full security report, the one without a Scope line, that a review of the new part counts from (spec 2.6).
+// Each is { sha, at, ok, blocking, open, ids, state, onHead } or null. With `on`, a High you accept in your approval of
+// the head no longer blocks a report on the head, though it stays open for the next review to check; ids are those of
+// the findings that still block, by which you would accept one (Pilot 3, spec 2.9 part 5).
+export function reviewReports(reviews, { roles, bot, head, approvers = [], on }) {
+  const { accepted } = on ? acceptedRisks(reviews, { approvers, head, on }) : { accepted: new Map() };
+  const all = reviews
+    .filter((r) => r.user?.login === bot)
+    .map((r) => ({ ...readReviewReport(r.body, roles), sha: r.commit_id, at: r.submitted_at, state: r.state }));
+  // open: the Critical and High findings open after the report, with those a report of the new part carries
+  // (openFindings), for the next review of the new part to check; blocking: how many.
+  const after = new Map(roles.flatMap((role) => {
+    const mine = all.filter((report) => report.role === role);
+    return openFindings(mine).map((open, i) => [mine[i], open]);
+  }));
+  const named = (report) => (after.get(report) ?? []).map(({ severity, where, finding }) => ({ severity, where, finding }));
+  const brief = (report) => {
+    if (!report) return null;
+    const open = named(report);
+    const still = report.sha === head ? stillBlocking(open, accepted) : open;
+    // Only a High can be accepted, so only Highs get an id to name (review round 4 of shop PR #13).
+    const ids = still.filter(({ severity }) => severity === 'High').map(findingId);
+    // counts: the findings of this report by severity, with the Mediums counted as Low for want of a repro (C1 spec 4.2).
+    return { sha: report.sha, at: report.at, ok: report.ok, blocking: still.length, open, ids, state: report.state, onHead: report.sha === head, counts: findingCounts(report) };
+  };
+  const reports = Object.fromEntries(roles.map((role) => [role, brief(all.filter((report) => report.role === role).at(-1))]));
+  const fullOf = (role) => brief(all.filter((report) => report.role === role && !report.scope).at(-1));
+  // reported: the roles with a report on the PR, on any commit: the merge then needs theirs (C1 spec 3.1).
+  // blockingEver: a report of the PR, on any commit, had a Critical or High: the level of the item goes up a step.
+  // minor: the Medium and Low of the newest report of each role on the head, for the findings Task of the Epic (C1 spec
+  // section 2).
+  const minor = roles.flatMap((role) => {
+    const newest = all.filter((report) => report.role === role).at(-1);
+    if (!newest || newest.sha !== head || !newest.ok) return [];
+    return newest.findings.filter(({ severity }) => ['Medium', 'Low'].includes(severity)).map(({ severity, where, finding, asked }) => ({ role, severity, where, finding, id: findingId({ where, finding }), ...(asked && { asked }) }));
+  });
+  return { reports, securityFull: fullOf('security'), reviewerFull: fullOf('reviewer'), reported: [...new Set(all.map(({ role }) => role).filter(Boolean))], blockingEver: all.some(({ blocking }) => (blocking?.length ?? 0) > 0), minor };
+}
+
+// The docs PR of an Epic: its branch, whether it is here or on GitHub, its newest PR, and the SPEC, design and plan on
+// it. Stage spec commits on the docs branch of this checkout and pushes only with the docs PR (spec 2.4), so when the
+// branch is here (`local`: { branch(name), file(branch, path) }), the documents are read from it, not from GitHub.
+export async function readDocs(github, epic, { gates, apps, approvers, space }, local) {
+  const { branch } = docsRule(gates, epic);
+  const here = Boolean(local?.branch?.(branch));
+  const exists = here || Boolean(await maybe(() => github.get(`/branches/${encodeURIComponent(branch)}`)));
+  // A merged docs PR may have its branch deleted; its PR is still listed.
+  const pulls = (await github.getAll('/pulls', { state: 'all', sort: 'created', direction: 'desc' })).filter(({ head }) => head.ref === branch);
+  const file = async (name) => {
+    if (here) return local.file(branch, `docs/specs/${epic}/${name}`);
+    if (!exists) return null;
+    const found = await maybe(() => github.get(`/contents/docs/specs/${epic}/${name}`, { ref: branch }));
+    return found?.content ? Buffer.from(found.content, 'base64').toString('utf8') : null;
+  };
+  return {
+    branch,
+    exists,
+    pr: pulls[0] ? await readPullRequest(github, pulls[0].number, { gates, apps, approvers, space }) : null,
+    spec: await file('spec.md'),
+    design: await file('design.md'),
+    plan: await file('plan.md'),
+  };
+}
+
+// The facts of one command. For a PR command (review, fix) `arg` is the PR number and the item is the one of its
+// branch; for the others it is a work item key, or nothing for status. ctx: { contract, mapping, roster, gates, apps,
+// approvers, space }.
+export async function gatherFacts({ command, arg, jira, github, local, ...ctx }) {
+  if (command === 'status' && !arg) return { command, space: ctx.space, ...(await readSpace({ jira, github, local, ...ctx })) };
+  if (command === 'intake') return { command, space: ctx.space, item: null, intake: await readIntake({ jira, ...ctx }) };
+  // A release command works on the release, not on one item (release-workflow spec 2.6, 2.7).
+  if (command === 'release') return { command, arg, extra: ctx.extra, space: ctx.space, item: null, runKey: arg ?? 'release', release: await readCutFacts({ jira, github, ...ctx }) };
+  // vX.Y.0 ships a release; vX.Y.Z with Z > 0 a hotfix (spec 2.7, 2.8).
+  if (command === 'ship' && /\.0$/.test(arg)) return { command, arg, space: ctx.space, item: null, runKey: arg, ship: await readShipFacts({ jira, github, local, ...ctx, version: arg }) };
+  if (command === 'ship') return { command, arg, space: ctx.space, item: null, runKey: arg, hotfix: await readHotfixFacts({ jira, github, ...ctx, version: arg }) };
+  if (command === 'rollback') return { command, arg, extra: ctx.extra, space: ctx.space, item: null, runKey: `rollback-${arg}`, rollback: await readRollbackFacts({ ...ctx, environment: arg, extra: ctx.extra }) };
+  let pr = null;
+  let key = arg;
+  // /ao-review <KEY> reviews after merge the PRs of an Epic's items, or of one item (SPEC-review-per-item.md section 4).
+  if (command === 'review' && !/^\d+$/.test(String(arg))) {
+    const item = await readWorkItem(jira, arg, ctx);
+    return { command, arg, space: ctx.space, item, pr: null, afterMerge: await readAfterMerge(github, item, ctx, local), run: local.runState(item.key) };
+  }
+  if (['review', 'fix'].includes(command)) {
+    pr = await readPullRequest(github, Number(arg), ctx);
+    key = pr.docsEpic ?? parseBranch(pr.headRef)?.key ?? null;
+    if (!key) return { command, arg, space: ctx.space, pr, item: null };
+    // The agent token may read other spaces; ao-step works in its own (spec 2.2).
+    if (!key.startsWith(`${ctx.space}-`)) return { command, arg, space: ctx.space, pr, item: null, outside: key };
+  }
+  const item = await readWorkItem(jira, key, ctx);
+  const epicKey = item.workType === 'epic' ? item.key : item.parent?.type === epicType(ctx.contract) ? item.parent.key : null;
+  const epic = epicKey === item.key ? item : epicKey ? await readWorkItem(jira, epicKey, ctx) : null;
+  const docs = epicKey ? await readDocs(github, epicKey, ctx, local) : null;
+  if (!pr && item.workType !== 'epic') {
+    const [newest] = await pullsOf(github, item.key);
+    pr = newest ? await readPullRequest(github, newest.number, ctx) : null;
+  }
+  // /ao-qa reads deployments with your gh login (`deploys`): the read token of ao-review may not (release-workflow T12).
+  const qa = command === 'qa' && pr ? await readQaFacts(ctx.deploys, pr, ctx) : undefined;
+  // After QA fail the PR of an item In Progress is merged: /ao-build reads the newest QA report (human-loop spec 5.2).
+  // /ao-qa --retest reads it for an item In QA: it runs again only after a NOT TESTED report.
+  // /ao-qa reads it always: after a QA fail, a QA again at level standard checks only the criteria it failed (C1 spec
+  // section 2).
+  const reportNeeded = (command === 'build' && item.state === 'in-progress' && pr?.merged) || command === 'qa';
+  const qaReport = reportNeeded ? await readLatestQaReport(jira, item.key, { notQa: notQaSigners(ctx.contract, ctx.mapping) }) : undefined;
+  // /ao-qa records the Medium and Low of a merged PR in the findings Task of the Epic (C1 spec section 2): which Task,
+  // and whether it names the PR already.
+  const findings = command === 'qa' && epic && pr?.merged && pr.minorFindings?.length > 0 ? await readFindingsTask(jira, { epic: epic.key, space: ctx.space, label: ctx.mapping.work_labels.findings, pr: pr.number }) : undefined;
+  // /ao-qa of an item labelled light prints what to check, from its description (C1 spec section 2).
+  const description = command === 'qa' && item.level === 'light' ? await maybe(async () => adfText((await jira.get(`/rest/api/3/issue/${encodeURIComponent(item.key)}`, { fields: 'description' })).fields?.description)) : undefined;
+  // /ao-spec of an Epic: the Claude artifacts its description links, and those the design inbox holds; one not taken
+  // stops stage spec for /ao-design (tasks/todo.md item 10).
+  // The links are read from the whole description, smart links and link marks included, which plain text leaves out.
+  // null when Jira answers 404 for the Epic: /ao-spec stops then, as its links are not known (review of shop PR #98: []
+  // let stage spec run ux with no design).
+  const designLinks = command === 'spec' && item.workType === 'epic' ? await maybe(async () => descriptionLinks((await jira.get(`/rest/api/3/issue/${encodeURIComponent(item.key)}`, { fields: 'description' })).fields?.description)) : undefined;
+  // A kit another project reviewed needs no agent (kit-copy-review spec 2.1). Only on an open PR with green CI, which
+  // /ao-review would review, and while a report is missing on its head: the compare reads GitHub and renders the agents
+  // (review of ao-pilot PR #24). ctx.kitCopy(pr) resolves to null when the PR claims no such thing.
+  const missing = pr && ctx.gates.github_apps.review.roles.some((role) => !pr.reports[role]?.onHead);
+  const reviewable = pr?.state === 'open' && pr.ci.green;
+  const kitCopy = command === 'review' && reviewable && missing && ctx.kitCopy ? await ctx.kitCopy(pr) : null;
+  const guards = item.workType && item.workType !== 'epic' ? await githubGuards(github, { item, needed: ['dependencies-merged'], contract: ctx.contract, mapping: ctx.mapping }) : [];
+  return {
+    command,
+    arg,
+    space: ctx.space,
+    item,
+    epic,
+    docs,
+    pr,
+    dependenciesMerged: guards.includes('dependencies-merged'),
+    ...(qa && { qa }),
+    ...(qaReport !== undefined && { qaReport }),
+    ...(description !== undefined && { description }),
+    ...(designLinks !== undefined && { designLinks, designInbox: local.designInbox?.(item.key) ?? null }),
+    ...(findings !== undefined && { findings }),
+    ...(kitCopy && { kitCopy }),
+    wip: await readWip(jira, item, ctx),
+    // A New Story or Task that meets DoR: /ao-build asks jira-sync to refine it (SHOP-39 of shop, Phiên 33).
+    ...(command === 'build' && item.state === 'new' && { refinable: (await jiraGuards(jira, { key: item.key, actor: 'automation', needed: ['dor-met'], contract: ctx.contract, mapping: ctx.mapping })).includes('dor-met') }),
+    ledger: local.ledger(item.key),
+    // The Sub-tasks with a ledger: the agents of a split Story keep one per Sub-task.
+    subtaskLedgers: (item.subtasks ?? []).filter(({ key: sub }) => local.ledger(sub)).map(({ key: sub }) => sub),
+    run: local.runState(item.key),
+    seoApproved: seoApprovedOf(local, item.key),
+    // /ao-status <Epic> adds the runs of its items, for the cost per acceptance criterion (C1 spec section 7).
+    // /ao-status <Epic> says which PRs of its items wait for their review after merge (SPEC-review-per-item.md 6.3).
+    ...(command === 'status' && item.workType === 'epic' && { afterMerge: await readAfterMerge(github, item, ctx, local) }),
+    ...(command === 'status' && item.workType === 'epic' && { itemRuns: (item.children ?? []).flatMap((child) => [child, ...(child.subtasks ?? [])]).map(({ key: k }) => ({ key: k, runs: local.runState(k)?.runs ?? [] })) }),
+  };
+}
+
+// What /ao-review <KEY> reads (SPEC-review-per-item.md section 4): the PRs of the Epic's Stories, Tasks and Bugs, or of
+// the item, merged into develop, each with whether it skipped review on its last head and its newest mark of a review
+// after merge; for those still to review, their files, the commit before the oldest merge and the head of develop; the
+// items not merged yet; and the reports runs saved in .ai/reviews/ under <KEY>- (local.reviews).
+export async function readAfterMerge(github, item, { gates, apps }, local) {
+  const KINDS = ['story', 'task', 'bug'];
+  const items = item.workType === 'epic' ? (item.children ?? []).filter(({ workType }) => KINDS.includes(workType)) : KINDS.includes(item.workType) ? [item] : [];
+  const bot = botLogin(apps.review);
+  const all = items.length > 0 ? (await github.getAll('/pulls', { state: 'all', sort: 'created', direction: 'desc' })).filter(sameRepo) : [];
+  const pulls = [];
+  for (const { key } of items) {
+    for (const pr of all.filter((p) => p.merged_at && p.base?.ref === 'develop' && parseBranch(p.head.ref)?.key === key)) {
+      const skipped = skippedReview(await github.getAll(`/pulls/${pr.number}/reviews`), { bot, head: pr.head.sha });
+      const mark = skipped ? newestMark(await github.getAll(`/issues/${pr.number}/comments`), { bot }) : null;
+      pulls.push({ number: pr.number, key, merged: true, skipped, mark, mergeCommit: pr.merge_commit_sha, mergedAt: pr.merged_at });
+    }
+  }
+  const todo = pulls.filter(({ skipped, mark }) => skipped && !mark);
+  const files = [];
+  let base = null;
+  let head = null;
+  if (todo.length > 0) {
+    for (const { number } of todo) files.push(...touchedPaths(await github.getAll(`/pulls/${number}/files`)));
+    const oldest = [...todo].sort((a, b) => Date.parse(a.mergedAt) - Date.parse(b.mergedAt))[0];
+    base = (await github.get(`/commits/${oldest.mergeCommit}`)).parents?.[0]?.sha ?? null;
+    head = (await github.get('/git/ref/heads/develop')).object?.sha ?? null;
+  }
+  const merged = new Set(pulls.map(({ key }) => key));
+  return {
+    pulls,
+    files: [...new Set(files)].sort(),
+    base,
+    head,
+    levels: Object.fromEntries(items.map(({ key, level }) => [key, level ?? null])),
+    waiting: items.filter(({ key, state }) => !merged.has(key) && !['done', 'cancelled'].includes(state)).map(({ key }) => key),
+    reports: local.reviews?.(`${item.key}-`) ?? {},
+  };
+}
+
+// The findings Task of an Epic, the oldest with the label, and whether one of its comments records PR `pr` already:
+// { key, recorded }, key null when the Epic has none yet.
+export async function readFindingsTask(jira, { epic, space, label, pr }) {
+  const [task] = await jira.searchAll(`project = "${space}" AND parent = "${epic}" AND labels = "${label}" ORDER BY created ASC`, ['summary']);
+  if (!task) return { key: null, recorded: false };
+  const comments = await jira.getAll(`/rest/api/3/issue/${encodeURIComponent(task.key)}/comment`, {}, 'comments');
+  return { key: task.key, recorded: comments.some(({ body }) => adfText(body).includes(recordedLine(pr))) };
+}
+
+const epicType = (contract) => contract.work_types.find(({ id }) => id === 'epic').jira_issue_type;
+
+// What /ao-intake prints (human-loop spec 3.1): the Epics of the space not done, newest first, the WIP of epic-shaping,
+// and the Jira ids of the Bug fields Found in and Severity, which the main session sets when it creates a Bug.
+export async function readIntake({ jira, contract, mapping, space }) {
+  const found = await jira.searchAll(`project = "${space}" AND issuetype = "${epicType(contract)}" AND statusCategory != Done ORDER BY created DESC`, ['summary', 'status']);
+  const [workflowId] = Object.entries(contract.workflows).find(([, w]) => w.applies_to.includes('epic'));
+  const shaping = ['specifying', 'planning'].map((state) => mapping.workflows[workflowId].states[state].status);
+  const fields = await jira.get('/rest/api/3/field');
+  const idOf = (id) => fields.find(({ name }) => name === mapping.fields[id].jira_field)?.id ?? null;
+  return {
+    epics: found.map(({ key, fields: f }) => ({ key, summary: f.summary, status: f.status.name })),
+    epicShaping: { used: found.filter(({ fields: f }) => shaping.includes(f.status.name)).length, limit: contract.wip_limits.find(({ id }) => id === 'epic-shaping').limit },
+    bugFields: { 'found-in': idOf('found-in'), severity: idOf('severity') },
+  };
+}
+
+// Room under the WIP limits: Epics shaping (spec or plan) and each dev agent the item would start.
+async function readWip(jira, item, { contract, mapping, agentsPerRole }) {
+  const limit = (id) => contract.wip_limits.find((w) => w.id === id).limit;
+  const [workflowId] = Object.entries(contract.workflows).find(([, w]) => w.applies_to.includes('epic'));
+  const shaping = ['specifying', 'planning'].map((state) => mapping.workflows[workflowId].states[state].status);
+  const space = item.key.slice(0, item.key.lastIndexOf('-'));
+  const epics = await jira.searchAll(`project = "${space}" AND issuetype = "${epicType(contract)}" AND status in (${shaping.map((s) => `"${s}"`).join(', ')})`, ['status']);
+  // The guard wip-available of jira-guard, read with the items that hold the WIP, which the stop names (T14 of C2).
+  const devAgent = {};
+  const holders = {};
+  for (const role of new Set([item.role, ...item.subtasks.map(({ role }) => role)].filter(Boolean))) {
+    const held = await wipHolders(jira, { space, actor: role, contract, mapping, agentsPerRole });
+    devAgent[role] = held.keys.length < held.limit;
+    holders[role] = held.keys.filter((key) => key !== item.key);
+  }
+  return { epicShaping: { used: epics.length, limit: limit('epic-shaping') }, devAgent, holders };
+}
+
+// /ao-status without a key: every item of the space not done, the open PRs, and the runs in .ai/runs/.
+async function readSpace({ jira, github, deploys, local, contract, mapping, roster, space, reviewDefault }) {
+  const names = agentNames(contract, mapping);
+  const found = await jira.searchAll(`project = "${space}" AND statusCategory != Done ORDER BY Rank ASC`, ['summary', 'issuetype', 'status', 'labels', 'parent', 'comment']);
+  const items = found.map(({ key, fields }) => {
+    const labels = fields.labels ?? [];
+    const comments = fields.comment?.comments ?? [];
+    const flagged = labels.includes(mapping.needs_you_label);
+    return {
+      key,
+      type: fields.issuetype.name,
+      ...locate(fields.issuetype.name, fields.status.name, contract, mapping),
+      status: fields.status.name,
+      summary: fields.summary,
+      labels,
+      ...workLabels(labels, mapping, roster),
+      flagged,
+      flag: flagged ? (latestFlagComment(comments)?.kind ?? 'other') : null,
+      parent: fields.parent?.key ?? null,
+      requests: openRequests(comments, names, { agentAccount: agentsAccount(mapping) }),
+      // Whether it skips review, from its labels as they are (SPEC-review-per-item.md 3.4): /ao-run then goes on from its
+      // draft PR to /ao-review, which reads the labels with their changelog before it skips anything.
+      review: reviewChoice({ labels, names: reviewLabels(mapping), projectDefault: reviewDefault }),
+      // The findings Task of an Epic: /ao-run counts the Epic done with it still open (SPEC-review-per-item.md 6.1).
+      findings: labels.includes(mapping.work_labels.findings),
+    };
+  });
+  // An Epic In Progress with its items: /ao-status says when it can be completed.
+  for (const epic of items.filter(({ workType, state }) => workType === 'epic' && state === 'in-progress')) epic.children = await readChildren(jira, epic.key, { contract, mapping, roster, space });
+  const pulls = (await github.getAll('/pulls', { state: 'open', sort: 'created', direction: 'asc' })).filter(sameRepo).map((pr) => ({ number: pr.number, title: pr.title, headRef: pr.head.ref, key: parseBranch(pr.head.ref)?.key ?? null, draft: Boolean(pr.draft) }));
+  // The PRs merged lately (T14 of C2): an item In Review whose PR is merged waits for its deploy, not for a fix. One page
+  // of the PRs closed last is enough: an item waits there for its deploy, minutes after its merge.
+  const merged = (await github.get('/pulls', { state: 'closed', sort: 'updated', direction: 'desc', per_page: 50 })).filter((pr) => sameRepo(pr) && pr.merged_at).map((pr) => ({ number: pr.number, key: parseBranch(pr.head.ref)?.key ?? null }));
+  // The release lines of /ao-status need deployments, which only your gh login reads (release-workflow T12, T16).
+  const release = deploys ? await readStatusRelease({ jira, deploys, contract, mapping, space }) : undefined;
+  return { items, pulls, merged, runs: local.runStates(), ...(release && { release }) };
+}
+
+// The login of the deployer on GitHub: the bot of the App ao-deploy, whose slug is <owner>-ao-deploy (docs/github-apps-setup.md).
+const DEPLOYER = /-ao-deploy\[bot\]$/;
+
+// The release running in each environment of the mapping (release-workflow spec 2.5): the newest deployment whose
+// latest status is success, as { sha, deployment, url }, or null. GitHub sets the older ones inactive when a new one
+// succeeds, so a newer deploy that failed, or one still under way, leaves the one before running.
+export async function readRunning(github, mapping) {
+  const running = {};
+  for (const [env, { github_environment: environment }] of Object.entries(mapping.environments)) {
+    running[env] = null;
+    for (const { id, sha } of await github.get('/deployments', { environment, per_page: 30 })) {
+      const [latest] = await github.get(`/deployments/${id}/statuses`, { per_page: 1 });
+      // Only the deployer's word counts: qa sends the basic auth to the URL of this status (security, ao-pilot PR #17).
+      if (latest?.state !== 'success' || !DEPLOYER.test(latest.creator?.login ?? '')) continue;
+      running[env] = { sha, deployment: id, url: latest.environment_url ?? null };
+      break;
+    }
+  }
+  return running;
+}
+
+// Whether the commit `running` holds `commit`: it is that commit, or comes after it.
+export async function contains(github, running, commit) {
+  if (running === commit) return true;
+  return ['ahead', 'identical'].includes((await github.get(`/compare/${commit}...${running}`)).status);
+}
+
+// What the release commands decide on, besides the item (release-workflow spec 2.6 to 2.9): the release running in
+// each environment, the release branches with commits main does not have yet, the tags, and the Fix Versions of the
+// space on Jira.
+export async function readReleaseFacts({ github, jira, mapping, space }) {
+  const releaseBranches = [];
+  for (const { ref, object } of (await maybe(() => github.getAll('/git/matching-refs/heads/release/'))) ?? []) {
+    const name = ref.replace(/^refs\/heads\//, '');
+    const branch = parseBranch(name);
+    if (branch?.kind !== 'release') continue;
+    if ((await github.get(`/compare/main...${object.sha}`)).ahead_by > 0) releaseBranches.push({ name, version: branch.version, sha: object.sha });
+  }
+  return {
+    running: await readRunning(github, mapping),
+    releaseBranches,
+    tags: (await github.getAll('/tags')).map(({ name, commit }) => ({ name, sha: commit.sha })),
+    versions: (await jira.get(`/rest/api/3/project/${encodeURIComponent(space)}/versions`)).map(({ name, released }) => ({ name, released: Boolean(released) })),
+  };
+}
+
+
+// The QA facts of an item whose PR `pr` is merged (release-workflow spec 2.5): the QA environment of its route
+// (routing.yaml, by the base branch of the PR), the release running there, and whether that release holds the merge.
+export async function readQaFacts(deploys, pr, { contract, mapping }) {
+  if (!deploys) throw new Error('/ao-qa reads deployments with your gh login: log in with gh auth login');
+  const environment = qaEnvironment(contract, pr.base);
+  const found = (await readRunning(deploys, mapping))[environment];
+  const running = found && { ...found, projectText: await projectAt(deploys, found.sha) };
+  return { environment, running, contains: Boolean(running && pr.mergeCommit && (await contains(deploys, running.sha, pr.mergeCommit))) };
+}
+
+// What /ao-release decides on (release-workflow spec 2.6): the release facts, and the cut point of develop since the
+// newest tag. history(tag) resolves the first-parent history of develop after `tag` (all of it when tag is null), as
+// `git log --first-parent --reverse --format=%H%x09%s` prints it. An item Jira does not answer for holds the cut point
+// back like any item not Done.
+export async function readCutFacts({ jira, github, deploys, history, contract, mapping, space, apps }) {
+  if (!deploys) throw new Error('/ao-release reads deployments with your gh login: log in with gh auth login');
+  const facts = await readReleaseFacts({ github: deploys, jira, mapping, space });
+  const tags = facts.tags.map(({ name }) => name);
+  const newest = latestTag(tags);
+  const commits = parseHistory(await history(newest), space);
+  const epicType = contract.work_types.find(({ id }) => id === 'epic').jira_issue_type;
+  const info = {};
+  const epics = [];
+  for (const key of new Set(commits.flatMap(({ keys }) => keys))) {
+    const found = await maybe(() => jira.get(`/rest/api/3/issue/${encodeURIComponent(key)}`, { fields: 'status,issuetype,fixVersions' }));
+    if (found?.fields.issuetype.name === epicType) epics.push(key);
+    info[key] = found
+      ? { state: locate(found.fields.issuetype.name, found.fields.status.name, contract, mapping).state, status: found.fields.status.name, fixVersions: (found.fields.fixVersions ?? []).map(({ name }) => name) }
+      : { state: null, status: 'not on Jira', fixVersions: [] };
+  }
+  const items = Object.fromEntries(Object.entries(info).map(([key, { state }]) => [key, state]));
+  const { cut, included, after, cancelled } = cutPoint({ commits, items, epics });
+  const withInfo = (list) => list.map(({ key }) => ({ key, ...info[key] }));
+  // The PRs up to the cut point that skipped review and still wait for their review after merge (SPEC-review-per-item.md
+  // 5.3): gate ④ names them, though the release branch goes to Staging anyway.
+  const upTo = cut ? commits.slice(0, commits.findIndex(({ sha }) => sha === cut.sha) + 1).map(({ sha }) => sha) : [];
+  const reviewGaps = github && apps && upTo.length > 0 ? releaseReviewMissing(await withEpics(jira, await releasePullsOf(github, upTo, { apps, bases: ['develop'] }), contract)) : [];
+  return { latestTag: newest, version: nextRelease(tags), commits: commits.length, cut, included: withInfo(included), after: withInfo(after), cancelled: withInfo(cancelled), versions: facts.versions, releaseBranches: facts.releaseBranches, reviewGaps };
+}
+
+// The Epic of each PR that still waits for its review after merge, so that gate ④ and /ao-ship name the command to
+// type (the trial of review per item, SHOP-95: the line read /ao-review <its Epic>). An item Jira does not give keeps none.
+async function withEpics(jira, pulls, contract) {
+  const epicType = contract.work_types.find(({ id }) => id === 'epic').jira_issue_type;
+  const out = [];
+  for (const pull of pulls) {
+    if (!pull.skipped || pull.mark) {
+      out.push(pull);
+      continue;
+    }
+    const found = await maybe(() => jira.get(`/rest/api/3/issue/${encodeURIComponent(pull.key)}`, { fields: 'parent' }));
+    const parent = found?.fields?.parent;
+    out.push(parent?.fields?.issuetype?.name === epicType ? { ...pull, epic: parent.key } : pull);
+  }
+  return out;
+}
+
+const NOTES = ['changelog.md', 'pr-description.md', 'fix-version.md'];
+
+// Notes of devops written before the newest regression: the release branch may hold more since, such as a Bug fixed on
+// it (T21). With no run of release-notes on record, the files are taken as they are.
+function notesStale(runs) {
+  const last = (purpose) => runs.findLastIndex((r) => r.purpose === purpose && r.outcome === 'done');
+  const notes = last('release-notes');
+  return notes >= 0 && last('regression') > notes;
+}
+
+// What /ao-ship vX.Y.0 decides on (release-workflow spec 2.7): its release branch, the release Staging runs, the Bugs
+// Critical and High still open with its Fix Version, the newest regression on record in .ai/runs/<version>/ (the
+// commit it ran on, from state.json, and the Result line of its report), the files the branch changed since that
+// commit, whether devops wrote its notes, and the open release PR. local: { runState(key), runFile(key, name) }.
+export async function readShipFacts({ jira, github, deploys, local, contract, mapping, space, version, apps }) {
+  if (!deploys) throw new Error('/ao-ship reads deployments with your gh login: log in with gh auth login');
+  const release = await readReleaseFacts({ github: deploys, jira, mapping, space });
+  if (release.running.staging) release.running.staging.projectText = await projectAt(deploys, release.running.staging.sha);
+  const branch = release.releaseBranches.find(({ name }) => name === `release/${version}`) ?? null;
+  const bugType = contract.work_types.find(({ id }) => id === 'bug').jira_issue_type;
+  const severityField = mapping.fields.severity.jira_field;
+  const bugs = [];
+  for (const { name } of contract.work_item_fields.find(({ id }) => id === 'severity').values.filter(({ id }) => ['critical', 'high'].includes(id))) {
+    const found = await jira.searchAll(`project = "${space}" AND issuetype = "${bugType}" AND fixVersion = "${version}" AND statusCategory != Done AND "${severityField}" = "${name}"`, ['status']);
+    bugs.push(...found.map(({ key }) => ({ key, severity: name })));
+  }
+  const last = (local.runState(version)?.runs ?? []).filter(({ purpose }) => purpose === 'regression').at(-1);
+  const regression = last?.qa?.sha ? { sha: last.qa.sha, result: last.outcome === 'done' ? regressionResult(local.runFile(version, 'regression-report.md')) : null } : null;
+  let changedSinceRegression = null;
+  if (regression && branch) {
+    const files = regression.sha === branch.sha ? [] : ((await github.get(`/compare/${regression.sha}...${branch.sha}`)).files ?? []);
+    changedSinceRegression = [...new Set(files.flatMap(({ filename, previous_filename: previous }) => (previous ? [previous, filename] : [filename])))].sort();
+  }
+  const pr = (await github.getAll('/pulls', { state: 'open', base: 'main' })).find(({ head }) => head.ref === `release/${version}`);
+  // The PRs the release brings that skipped review and still wait for their review after merge (SPEC-review-per-item.md
+  // 5.3): /ao-ship stops before gate ⑤, where merge-gate would hold the release PR for them.
+  const compare = branch && apps ? await maybe(() => github.get(`/compare/main...${branch.name}`)) : null;
+  const reviewGaps = !compare ? [] : releaseReviewMissing((compare.total_commits ?? 0) >= 250 ? null : await withEpics(jira, await releasePullsOf(github, (compare.commits ?? []).map(({ sha }) => sha), { apps, bases: ['develop', branch.name] }), contract));
+  return {
+    reviewGaps,
+    version,
+    branch,
+    staging: release.running.staging,
+    bugs,
+    regression,
+    changedSinceRegression,
+    notes: NOTES.every((name) => local.runFile(version, name) !== null) && !notesStale(local.runState(version)?.runs ?? []),
+    pr: pr ? { number: pr.number, headSha: pr.head.sha } : null,
+  };
+}
+
+// What /ao-ship vX.Y.(Z+1) decides on (release-workflow spec 2.8): the release on Production (the tag of the commit that
+// runs there) and its next patch, the merge at the head of main and the Bug of its hotfix branch, what Staging runs,
+// the tag of the version, a deployment request for the head of main, and the open release branches.
+export async function readHotfixFacts({ jira, github, deploys, contract, mapping, space, version }) {
+  if (!deploys) throw new Error('/ao-ship reads deployments with your gh login: log in with gh auth login');
+  const release = await readReleaseFacts({ github: deploys, jira, mapping, space });
+  const names = release.tags.map(({ name }) => name);
+  const onProduction = release.running.production;
+  const tagged = onProduction ? release.tags.find(({ sha }) => sha === onProduction.sha)?.name : null;
+  const production = tagged ? { sha: onProduction.sha, version: tagged } : null;
+  const head = (await github.get('/git/ref/heads/main')).object.sha;
+  const merged = (await github.getAll(`/commits/${head}/pulls`)).find((pr) => pr.merged_at && pr.merge_commit_sha === head);
+  const pull = merged ? { number: merged.number, head: merged.head.ref, key: parseBranch(merged.head.ref)?.key ?? null } : null;
+  let bug = null;
+  if (pull?.key) {
+    const found = await maybe(() => jira.get(`/rest/api/3/issue/${encodeURIComponent(pull.key)}`, { fields: 'status,issuetype,fixVersions' }));
+    if (found) bug = { key: pull.key, state: locate(found.fields.issuetype.name, found.fields.status.name, contract, mapping).state, status: found.fields.status.name, fixVersions: (found.fields.fixVersions ?? []).map(({ name }) => name) };
+  }
+  const requests = await deploys.get('/deployments', { environment: mapping.environments.production.github_environment, per_page: 30 });
+  const request = requests.find(({ sha, payload }) => payload?.ao === 'request' && sha === head);
+  return {
+    version,
+    production,
+    expected: production ? nextPatch(names, production.version) : null,
+    main: { sha: head, pull },
+    bug,
+    staging: release.running.staging,
+    tag: release.tags.find(({ name }) => name === version) ?? null,
+    request: request ? { id: request.id, sha: request.sha } : null,
+    releaseBranches: release.releaseBranches,
+  };
+}
+
+// What /ao-rollback <environment> [<sha>] decides on (release-workflow spec 2.9): the release that runs there, the
+// releases that ran there before (a status success once, now inactive), newest first, the commit `extra` names, and a
+// deployment request the deployer has not answered yet.
+export async function readRollbackFacts({ deploys, mapping, environment, extra }) {
+  if (!deploys) throw new Error('/ao-rollback reads deployments with your gh login: log in with gh auth login');
+  let running = null;
+  let requested = null;
+  const earlier = [];
+  for (const { id, sha, payload } of await deploys.get('/deployments', { environment: mapping.environments[environment].github_environment, per_page: 30 })) {
+    const statuses = await deploys.get(`/deployments/${id}/statuses`, { per_page: 30 });
+    if (statuses.length === 0 && payload?.ao === 'request' && !requested) requested = { id, sha };
+    if (!statuses.some(({ state }) => state === 'success')) continue;
+    if (!running && statuses[0].state === 'success') running = { sha, deployment: id };
+    else if (running && sha !== running.sha && !earlier.some((e) => e.sha === sha)) earlier.push({ sha, deployment: id });
+  }
+  const resolved = extra ? await maybe(() => deploys.get(`/commits/${extra}`)) : null;
+  return { environment, running, earlier, target: resolved ? { sha: resolved.sha } : null, requested };
+}
+
+// The release lines of /ao-status (release-workflow spec 2.2): what runs where, the release on Production and whether
+// its Fix Version is Released on Jira, the open release branches, and the Stories, Tasks and Bugs Done but in no
+// released Fix Version yet.
+async function readStatusRelease({ jira, deploys, contract, mapping, space }) {
+  const release = await readReleaseFacts({ github: deploys, jira, mapping, space });
+  // The public apps of what runs, for the URL lines of /ao-status (project-scaffold part 2, spec 2.4).
+  for (const running of Object.values(release.running).filter(Boolean)) running.projectText = await projectAt(deploys, running.sha);
+  const onProduction = release.running.production;
+  const name = onProduction ? release.tags.find(({ sha }) => sha === onProduction.sha)?.name : null;
+  const version = name ? release.versions.find((v) => v.name === name) : null;
+  const [workflowId] = Object.entries(contract.workflows).find(([, w]) => w.applies_to.includes('story'));
+  const done = mapping.workflows[workflowId].states.done.status;
+  const types = contract.work_types.filter(({ id }) => ['story', 'task', 'bug'].includes(id)).map(({ jira_issue_type: type }) => `"${type}"`).join(', ');
+  const found = await jira.searchAll(`project = "${space}" AND issuetype in (${types}) AND status = "${done}" AND (fixVersion is EMPTY OR fixVersion in unreleasedVersions())`, ['status']);
+  return { running: release.running, productionVersion: version ? { name, released: version.released } : null, releaseBranches: release.releaseBranches, doneUnreleased: found.map(({ key }) => key) };
+}

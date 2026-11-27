@@ -1,0 +1,256 @@
+# Quality gates of a project (quality-gates spec sections 2.2–2.8). CI, merge-gate, audit, gh:protect and the hooks read
+# the project's copy in .ai-orchestrator/quality/. That copy is a protected path, and a PR that lowers a threshold here
+# turns the policy job red.
+
+# The jobs of kit/.github/workflows/ci.yml; merge-gate, audit and the rulesets of PRs require every one of them.
+checks: [policy, build-test, secrets, sast]
+
+# Coverage of the lines a PR adds or changes, read from the lcov files the project's test:coverage script writes. The
+# project's coverage must include every source file, even one no test imports yet. Config files and generated
+# migrations are left out (Checkpoint 1, 2026-10-29), and so is the kit copy in .ai-orchestrator/ and .claude/, whose
+# code is tested in the kit. So are the scripts at the root of a project, which run on your machine, as scripts/dev.mjs
+# starts the apps (project-scaffold T17).
+# A Java app writes the JaCoCo XML report of its test:coverage (mvn verify), and its sources sit in src/main/java/
+# (project-scaffold part 3, spec 2.3). The e2e/ and scripts/ of each app of a pnpm project are left out as those at the
+# root are. An app leaves more out with coverage_exclude in project.yaml, a protected file.
+coverage:
+  changed_lines_min: 80
+  lcov: ["coverage/lcov.info", "apps/*/coverage/lcov.info"]
+  jacoco: ["apps/*/target/site/jacoco/jacoco.xml"]
+  source: ["**/*.{ts,tsx,js,jsx,mjs,cjs}", "**/src/main/java/**/*.java"]
+  exclude: ["**/*.{test,spec}.*", "**/*.e2e-spec.*", "**/*.d.ts", "**/*.config.*", "**/migrations/**", "{,apps/*/}e2e/**", "{,apps/*/}scripts/**", ".ai-orchestrator/**", ".claude/**"]
+
+# npm audit fails on this level and above. An exception names a GitHub advisory, why it is accepted, and when it ends.
+# A project keeps its own exceptions in dependencies.exceptions of its project.yaml, which a kit copy leaves alone; the
+# policy job reads both (C1 spec section 5). licenses: the SPDX ids dep-check accepts for a new library.
+dependencies:
+  audit_level: high
+  exceptions: []
+  # What the kit's own prompts and skills run with npx, which gh-guard lets an agent download as an approved library;
+  # anything else npx or a dlx would download must be approved first (review of shop PR #79). range: the versions
+  # allowed, all when left out.
+  tools:
+    - { ecosystem: npm, name: "@playwright/cli", range: "0.1.22" }
+    - { ecosystem: npm, name: playwright }
+  licenses: [MIT, MIT-0, ISC, Apache-2.0, BSD-2-Clause, BSD-3-Clause, 0BSD, Unlicense, CC0-1.0, BlueOak-1.0.0, MPL-2.0, EPL-2.0, Python-2.0]
+
+# Lines that switch a check off. A line that also carries the reason marker passes, so the reviewer can read why;
+# a `never` pattern fails even with a reason.
+suppressions:
+  reason_marker: "reason:"
+  patterns:
+    - "eslint-disable"
+    - "oxlint-disable"   # oxlint, the linter of NestJS 12, honours both (Pilot 1 T1)
+    - "@ts-ignore"
+    - "@ts-nocheck"
+    - ".skip("
+    - "xit("
+    - "xdescribe("
+    - "istanbul ignore"
+    - "c8 ignore"
+    - "nosemgrep"
+    - "gitleaks:allow"
+    - "secretlint-disable"
+    # Java (project-scaffold part 3, spec 2.3): javac, SonarQube, JUnit, Checkstyle, Spotless, SpotBugs, PMD, and
+    # @Generated, which JaCoCo leaves out of the coverage.
+    - "@SuppressWarnings"
+    - "NOSONAR"
+    - "@Disabled"
+    - "CHECKSTYLE:OFF"
+    - "CHECKSTYLE.OFF"
+    - "spotless:off"
+    - "@SuppressFBWarnings"
+    - "NOPMD"
+    - "@Generated"
+  never: [".only("]
+
+# Branches only a PR may change, and the merge method of each kind of work item branch.
+protected_branches: [develop, main, "release/*"]
+merge_method:
+  feature: squash
+  bugfix: squash
+  hotfix: squash
+
+# The PR of a release branch into main, and the PR that merges main back into develop or the open release branch
+# (release-workflow spec 2.7). merge-gate merges both with a merge commit, so each release keeps its history on main. A
+# release PR needs green CI and your approval on its head; after it merges, merge-gate tags the merge commit and opens
+# the merge back. A merge back needs green CI, no conflict, and the head of main to be the commit of a v* tag, which only
+# ao-merge and you may make (Pilot 3, spec 2.9): every commit of main passed gate ③ or gate ⑤. The PR of the release
+# report, release-notes/vX.Y.Z into release/vX.Y.Z, needs green CI and to change only that report and CHANGELOG.md.
+release_pull_requests:
+  merge_method: merge
+  tag: v<VERSION>
+  back_merge_bases: [develop, "release/*"]
+  back_merge_after_release: develop
+
+# Files an agent may not edit, except the roles listed as editors. A PR of an agent that touches one is never merged by
+# merge-gate: you read the diff and merge it yourself. A path is compared in any case (.Claude/ is .claude/), since a
+# Windows checkout writes both into one folder.
+protected_paths:
+  - { path: ".github/workflows/**", editors: [devops] }
+  - { path: ".githooks/**" }
+  - { path: ".claude/**" }
+  - { path: ".ai-orchestrator/**" }
+  - { path: ".mcp.json" }
+  - { path: ".github/CODEOWNERS" }
+  # A .claude folder in an app, which Claude Code loads as the root's once an agent reads a file there (review of shop
+  # PR #79). A CLAUDE.md or an AGENTS.md there stays editable, in a PR reviewed as critical (review-tiers.mjs).
+  - { path: "**/.claude/**" }
+  # Where a package manager reads its registry, at any depth: written by an agent, it would install an approved name
+  # from elsewhere, as --registry would (review of shop PR #79).
+  - { path: "**/.npmrc" }
+  - { path: "**/.yarnrc*" }
+  - { path: "**/bunfig.toml" }
+  # Where pnpm and Maven read what they install and run (second review of shop PR #79): pnpm-workspace.yaml holds the
+  # catalogs, overrides and allowBuilds of pnpm, so whose install scripts run; a .pnpmfile changes any dependency as pnpm
+  # reads it; .mvn/ holds the extensions and options of Maven and the URL the wrapper downloads Maven from. You change
+  # them; the policy job still checks the catalogs and overrides of pnpm-workspace.yaml.
+  - { path: "**/pnpm-workspace.yaml" }
+  - { path: "**/.pnpmfile.*" }
+  - { path: "**/.mvn/**" }
+
+# Review by risk (C1 spec section 3): the tier of a PR is the highest its files touch, a renamed file by both names
+# (lib/quality/review-tiers.mjs). critical: the protected paths above and critical_paths: reviewer at xhigh, security
+# at the roster's max. sensitive: security at high. normal, any other file: reviewer at high, no security; CI still
+# runs its SAST, secret and osv-scanner jobs. docs: every file under docs_paths and none critical, as normal. A review
+# of only the new part runs at high, or at the critical efforts when the new part is critical. merge-gate and audit
+# ask for the security report by the same tiers, and always once security has reported on the PR.
+review:
+  critical_paths:
+    # who the user is, and secrets
+    - "**/auth/**"
+    - "**/*auth*.*"
+    - "**/*session*.*"
+    - "**/*crypto*.*"
+    - "**/.env*"
+    - "**/.npmrc"
+    # NestJS: who may call
+    - "**/*.guard.*"
+    - "**/*.strategy.*"
+    # Spring Boot (project-scaffold part 3, spec 2.3): security configuration and who the user is
+    - "**/*Security*.java"
+    - "**/*Auth*.java"
+    - "**/security/**"
+    # migrations that touch the data already there
+    - "**/migrations/**"
+    - "**/db/migration/**"
+    # how the app is built and shipped: an image, a wrapper that downloads the build tool, the deploy file
+    - "**/Dockerfile*"
+    - "**/docker-compose*.{yml,yaml}"
+    - "**/compose*.{yml,yaml}"
+    - "**/.mvn/**"
+    - "**/mvnw*"
+    - "**/deploy.yaml"
+    # What steers an agent session at any depth, such as CLAUDE.md, AGENTS.md or a .claude/ in an app, is critical in
+    # code, whatever this list says (lib/quality/review-tiers.mjs, review of shop PR #79).
+  sensitive_paths:
+    # dependencies, and how the app is configured and started
+    - "**/package.json"
+    - "**/package-lock.json"
+    - "**/pnpm-lock.yaml"
+    # pnpm 10 and later: which packages run install scripts (allowBuilds), skip the release cooldown, or are overridden
+    - "**/pnpm-workspace.yaml"
+    - "**/yarn.lock"
+    - "**/pom.xml"
+    - "**/next.config.*"
+    - "**/main.ts"
+    - "**/application*.{yml,yaml,properties}"
+    # where requests come in or are checked: NestJS and Next.js
+    - "**/*.module.ts"
+    - "**/*.controller.*"
+    - "**/*.pipe.*"
+    - "**/*.filter.*"
+    - "**/*.interceptor.*"
+    - "**/*.middleware.*"
+    - "**/middleware.*"
+    - "**/proxy.*"
+    - "**/route.*"
+    - "**/actions.*"
+    - "**/*.dto.*"
+    # where data is read and written, and the services around it
+    - "**/*.service.*"
+    - "**/*.repository.*"
+    - "**/*.entity.*"
+    - "**/prisma/**"
+    - "**/*.sql"
+    # Spring Boot: where requests come in, and what it reads and writes
+    - "**/*Controller.java"
+    - "**/*Filter.java"
+    - "**/*Interceptor.java"
+    - "**/*Service.java"
+    - "**/*Repository.java"
+    - "**/service/**"
+    - "**/domain/**"
+    - "**/dto/**"
+    # What keeps the browser and the API safe outside those (review of shop PR #79, where security found them normal):
+    # security headers and CSP, the env an app puts in its bundle, the proxy in front of it, the lint rules that ban
+    # unsafe code, the client that sends the API its token, the pages that log in, and how errors and authors are written
+    - "**/*security*.*"
+    - "**/env.*"
+    - "**/env/**"
+    - "**/Caddyfile*"
+    - "**/eslint.config.*"
+    - "**/.eslintrc*"
+    - "**/*api-client*.*"
+    - "**/*http-client*.*"
+    - "**/{login,logout,signin,signup,register}/**"
+    - "**/*ExceptionHandler*.*"
+    - "**/*Auditor*.*"
+  # A project adds paths of its own to critical_paths and sensitive_paths with review in its project.yaml, a protected
+  # file the kit copy leaves alone; it cannot take one away (lib/quality/review-tiers.mjs, withProjectPaths).
+  docs_paths:
+    - "docs/**"
+    - "**/*.md"
+  # Review waived by rule (C1 spec section 3.4): a PR whose every file is in `files`, for an item whose effective level
+  # is `level`, needs no report. ao-step posts a COMMENT review on the head with the line "Waiver: <id>" instead;
+  # merge-gate and audit work the rule out again from the PR's files and the item's label (lib/quality/waivers.mjs).
+  # A critical file makes the item heavy, so no waiver covers one. /ao-review <PR> full still reviews such a PR.
+  waivers:
+    - id: light-docs
+      level: light
+      files: ["docs/**", "**/*.md", "**/*.png", "**/*.jpg", "**/*.webp", "**/messages/*.json", "**/locales/**"]
+
+# A PR that copies a kit another project reviewed in full (kit-copy-review spec 2.2, 2.3): ao-step compares it with the
+# reviewed head and writes both reports, with no agent. A project's own files, such as .ai-orchestrator/project.yaml
+# and .ai-orchestrator/deploy.yaml (project-scaffold spec 2.1), are in none of these lists, so a PR that changes one is
+# reviewed as usual; .claude/settings.json, rendered from project.yaml, is checked as rendered below.
+kit_copy:
+  # The same in every project, compared both ways.
+  same:
+    - ".ai-orchestrator/{agents,contract,docs,lib,quality,scripts,templates,tracker}/**"
+    - ".ai-orchestrator/package*.json"
+    - ".claude/hooks/**"
+    - ".githooks/**"
+    - ".mcp.json"
+    - ".jira/config.yml"
+    - ".github/workflows/{ci,jira-sync,merge-gate,pr-events,pr-review}.yml"
+  # A project adds the skills of its stack, so only the files the PR changes are compared.
+  same_when_changed: [".claude/skills/**"]
+  # They hold the space key and the stack skills of the project: ao-step renders them again.
+  # settings.json takes the env of the project from its project.yaml (project-scaffold spec 2.1).
+  rendered: [".claude/agents/**", ".claude/rules/ai-orchestrator.md", ".claude/settings.json"]
+  # A copy may point only at the newest PR of the other project on this path and branch, so it cannot go back to an older
+  # kit.
+  newest_path: .ai-orchestrator/lib
+  newest_branch: develop
+
+# The docs PR of an Epic (dev-workflow spec 2.4): every file it changes is under these paths, its head is this branch,
+# ao-dev opened it, and <EPIC> is an Epic. merge-gate merges it without reviews or approval once the Epic is past this
+# gate and the CI run of its head started before you approved; audit takes its merge commit on the same terms. Rule Q5
+# keeps the paths in docs/, away from the protected paths, and the gate a gate of the contract.
+docs_pull_requests:
+  paths: ["docs/specs/<EPIC>/**", "docs/adr/**"]
+  branch: "feature/<EPIC>-spec"
+  gate: plan-approval
+
+# The GitHub Apps of the agents: the variables that name each App, the roles that use it, and the ao-pr.mjs commands
+# those roles may run with it.
+github_apps:
+  dev:
+    env: AO_DEV_APP
+    roles: [ba, sa, fe-dev, be-dev, devops]
+    commands: [create, edit, comment]
+  review:
+    env: AO_REVIEW_APP
+    roles: [reviewer, security]
+    commands: [review]

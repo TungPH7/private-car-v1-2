@@ -1,0 +1,146 @@
+# The config of this project (SPEC-project-scaffold.md 2.1), written by ao-kit init from the profile base-pnpm.
+name: private-car-v1-2
+package_manager: pnpm
+jira:
+  space: PCV12
+github:
+  repo: TungPH7/private-car-v1-2
+  approvers:
+    - TungPH7
+  apps:
+    dev: tungph7-ao-dev
+    dev_id: 5514949
+    review: tungph7-ao-review
+    review_id: 5514961
+    merge: tungph7-ao-merge
+    merge_id: 5756976
+  kit_peers: []
+repos:
+  - name: private-car-v1-2
+    path: .
+apps:
+  web:
+    repo: private-car-v1-2
+    path: apps/web
+    profile: nextjs
+    dev: pnpm --filter ./apps/web run dev
+    port:
+      env: PORT
+      default: 3000
+    health: /en
+    public: true
+    seo: true
+    e2e_env:
+      E2E_API_MOCKING: "1"
+    # The localhost URLs the apps give each other, here so that a lane moves them by its offset.
+    env:
+      NEXT_PUBLIC_SITE_URL: http://localhost:3000
+      API_URL: http://localhost:3001
+    hosts:
+      development: private-car-v1-2-dev.ao.t2g.io.vn
+      staging: private-car-v1-2-staging.ao.t2g.io.vn
+      production: private-car-v1-2.ao.t2g.io.vn
+    # The coverage.exclude of apps/web/vitest.config.ts (test files and .d.ts aside, which the kit leaves out): the
+    # test harness, and the route shells, boot and middleware that the E2E covers.
+    coverage_exclude:
+      - src/testing/**
+      - src/app/**
+      - src/instrumentation.ts
+      - src/proxy.ts
+  admin:
+    repo: private-car-v1-2
+    path: apps/admin
+    profile: react
+    dev: pnpm --filter ./apps/admin run dev
+    port:
+      env: PORT
+      default: 5173
+    health: /
+    # The admin panel: on a host of its own behind the basic auth of the VPS, never indexed.
+    public: true
+    seo: false
+    env:
+      API_URL: http://localhost:3001
+    hosts:
+      development: private-car-v1-2-admin-dev.ao.t2g.io.vn
+      staging: private-car-v1-2-admin-staging.ao.t2g.io.vn
+      production: private-car-v1-2-admin.ao.t2g.io.vn
+    # The coverage.exclude of apps/admin/vitest.config.ts (test files and .d.ts aside, which the kit leaves out): the
+    # test harness, the entry, env and env-coupled singletons, the app composition and the route shells the E2E covers.
+    coverage_exclude:
+      - src/testing/**
+      - src/main.tsx
+      - src/config/**
+      - src/app/provider.tsx
+      - src/app/router.ts
+      - src/app/routes.tsx
+      - src/app/configure-auth.ts
+      - src/app/observability.ts
+      - src/app/layouts/**
+      - src/app/routes/**
+      - src/lib/api/api.ts
+      - src/lib/react-query/query-client.ts
+      - src/lib/logger/app-logger.ts
+      - src/lib/i18n/i18n.ts
+  api:
+    repo: private-car-v1-2
+    path: apps/api
+    profile: spring-boot
+    dev: pnpm --filter ./apps/api run dev
+    port:
+      env: PORT
+      default: 3001
+    health: /actuator/health
+    # On a host of its own for Swagger UI (/swagger-ui.html), behind the basic auth of the VPS, never indexed.
+    public: true
+    seo: false
+    env:
+      APP_SECURITY_CORS_ALLOWED_ORIGINS: http://localhost:5173,http://localhost:3000
+    hosts:
+      development: private-car-v1-2-api-dev.ao.t2g.io.vn
+      staging: private-car-v1-2-api-staging.ao.t2g.io.vn
+      production: private-car-v1-2-api.ao.t2g.io.vn
+    # The <excludes> of jacoco-maven-plugin in apps/api/pom.xml, as source paths; MapperImpl is generated in target/.
+    coverage_exclude:
+      - src/main/java/com/tungph7/learnpostgres/LearnPostgresqlApiApplication.java
+      - src/main/java/com/tungph7/learnpostgres/feature/**/dto/**
+      - src/main/java/com/tungph7/learnpostgres/common/dto/**
+      - src/main/java/com/tungph7/learnpostgres/common/config/**
+      - src/main/java/**/*Properties.java
+      - src/main/java/com/tungph7/learnpostgres/common/error/ErrorCode.java
+      - src/main/java/com/tungph7/learnpostgres/common/error/ProblemDetailOpenApiCustomizer.java
+      - src/main/java/com/tungph7/learnpostgres/common/error/BadRequestException.java
+      - src/main/java/com/tungph7/learnpostgres/common/domain/CitextType.java
+roles:
+  optional: []
+review:
+  default: "off"
+runs:
+  worktrees: true
+  lanes_max: 3
+  # Free RAM another agent needs to start. This machine has 15.8 GB: lower lanes_max if it struggles.
+  min_free_ram_gb: 1.5
+  # Files git does not track that a lane needs: the database and secrets of the api, and AUTH_SECRET of web.
+  copy:
+    - apps/api/.env
+    - apps/web/.env.development
+  # Each lane has its own Postgres of apps/api/docker-compose.yml: these come before apps/api/.env. The ports move by
+  # (slot + 1) x 100 (5572, 5672, 5772) and the names end in -s1, -s2, -s3, so no lane meets another or yours. Port
+  # 5472 and the names private-car-v1-2-* keep this project apart from private-car-v1 (5452) and private-car-v1-1
+  # (5462).
+  lane_env:
+    ports:
+      POSTGRES_HOST_PORT: 5472
+      DB_PORT: 5472
+    names:
+      COMPOSE_PROJECT_NAME: private-car-v1-2
+      POSTGRES_CONTAINER_NAME: private-car-v1-2-postgres
+      COMPOSE_NETWORK_NAME: private-car-v1-2-api-network
+  budget_usd: 50
+  idle_hours: 8
+  agents_per_role:
+    be-dev: 3
+    fe-dev: 3
+    devops: 3
+claude:
+  allow: []

@@ -1,0 +1,59 @@
+# jira-sync (ai-orchestrator, tracker-integration spec section 2.7): on PR, review, CI, deployment and manual events,
+# moves the Jira work items whose guards hold, with the token of the automation account. Runs the kit copy in
+# .ai-orchestrator/. GitHub runs the workflow_run and deployment_status triggers only from the default branch.
+#
+# The code of a PR never holds the CI token (review of shop PR #21): an agent's branch could change the kit copy, or the
+# packages npm ci installs, and move any item with that token. So the events of a PR come through the run of the
+# workflow PR events, and reviews through that of PR review; both hold no secret, and jira-sync follows them with
+# workflow_run, which GitHub runs from the default branch. There is no pull_request or pull_request_review trigger, whose
+# workflows run from the PR, and no pull_request_target, which GitHub blocks on public repositories from 2026-12-02
+# unless a policy of the repository allows it (Pilot 3). The token is
+# a secret of the environment jira-sync, which only the protected branches may use, so no workflow of a PR reaches it on
+# GitHub. The same token is a user variable on your machine, for /ao-release and qa. gh-guard catches the usual ways an
+# agent could read it there, but it is no boundary: an agent runs as your Windows user. That is a risk you accept until
+# the CI token leaves the machine (reviews of shop PR #21).
+name: jira-sync
+
+on:
+  workflow_run:
+    # The name of the project's CI workflow; PR review: every review, since changes asked send the item back and an
+    # approval can let a merged and deployed item go to QA; and PR events: a PR that opens, moves or closes.
+    workflows: [CI, PR review, PR events]
+    types: [completed]
+  deployment_status:
+  workflow_dispatch:
+    inputs:
+      item:
+        description: Jira key of the work item to reconcile, such as an Epic whose plan you approved
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  statuses: read
+  deployments: read
+
+jobs:
+  # The job id is the check run name, which lib/tracker/facts.mjs leaves out of CI.
+  jira-sync:
+    runs-on: ubuntu-latest
+    # The environment holds JIRA_CI_TOKEN, for develop, main, release/* and v* only. No deployment: its deployment_status
+    # event would start jira-sync again.
+    environment:
+      name: jira-sync
+      deployment: false
+    # A run of CI, PR review or PR events for a PR from a fork concerns no item (review round 2 of shop PR #21).
+    # lib/tracker/sync.mjs says the same.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.head_repository.full_name == github.repository
+    steps:
+      # The commit of the default or protected branch the run is on: never the head of a PR.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - run: npm ci --prefix .ai-orchestrator
+      - run: node .ai-orchestrator/scripts/jira-sync.mjs
+        env:
+          JIRA_CI_TOKEN: ${{ secrets.JIRA_CI_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
